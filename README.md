@@ -98,6 +98,16 @@ Available modes:
 
 The single and fixed-stack nodes remain available as `Load LoRA (Quantized)` and `Load LoRA Stack (Quantized)`.
 
+To gate an individual entry while keeping your sampler setup, insert `LoRA Gate (Quantized)`:
+
+```text
+LoRA Stack Entry (Quantized) -> LoRA Gate (Quantized) -> Apply LoRA Stack (Quantized)
+```
+
+For [Krea 2 Turbo SDA](https://huggingface.co/F16/krea2-turbo-sda), use the Comfy-format LoRA and set `active_steps` to `2` with the author's 8-step sampling schedule. Other entries can connect directly to the same apply node. Gated entries always use runtime deltas, regardless of the stack mode, including on floating-point and W4A8 linear layers. Ungated entries retain the selected mode. Ordinary linear LoRAs and fused input/output slices are supported; unsupported adapters such as DoRA or convolutional LoRAs raise an error instead of remaining active throughout sampling.
+
+The gate switches off at the sigma boundary after the selected number of intervals in the sampler's actual schedule. This is an exact first-two-step gate for Euler; solvers with intermediate evaluations use the same sigma cutoff. It is not a diffusion-percentage control. Each sampling invocation, including a partial-denoise invocation, uses its own schedule. Set `active_steps` to `0` to disable the entry, or bypass the gate to apply it throughout sampling. Custom samplers must supply ComfyUI's `sample_sigmas` transformer option. Gated LoRAs are runtime-only and cannot be baked with Save Quantized Model.
+
 ## Nodes
 
 | Node | Purpose |
@@ -107,6 +117,7 @@ The single and fixed-stack nodes remain available as `Load LoRA (Quantized)` and
 | `Save Quantized Model (DynamicVRAM Safe)` | Export supported W4A4/W4A8/W8A8 layers with native metadata. |
 | `Quantized Lazy Torch Compile` | Compile after quantized object patches are active. |
 | `LoRA Stack Entry (Quantized)` | Define one independently bypassable LoRA path and strength. |
+| `LoRA Gate (Quantized)` | Limit one stack entry to the first N sigma intervals without changing sampler wiring. |
 | `Apply LoRA Stack (Quantized)` | Apply an autogrowing LoRA stack in a selected mode. |
 | `Load LoRA (Quantized)` | Load and apply one LoRA. |
 | `Load LoRA Stack (Quantized)` | Load and apply a fixed-size LoRA stack. |

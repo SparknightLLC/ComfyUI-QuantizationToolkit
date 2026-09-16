@@ -37,9 +37,10 @@ MAX_AUTOGROW_LORAS = 100
 
 
 class QuantizedLoraSpec:
-	def __init__(self, path, strength):
+	def __init__(self, path, strength, active_steps=None):
 		self.path = path
 		self.strength = strength
+		self.active_steps = active_steps
 
 
 def _collect_autogrow_lora_entries(loras):
@@ -390,6 +391,31 @@ class QuantizedLoraConfig(io.ComfyNode):
 		return io.NodeOutput(QuantizedLoraSpec(path, strength))
 
 
+class QuantizedLoraGate(io.ComfyNode):
+	@classmethod
+	def define_schema(cls):
+		return io.Schema(
+			node_id="QuantizedLoraGate",
+			display_name="LoRA Gate (Quantized)",
+			category="loaders",
+			description="Apply a stack entry only above the sigma boundary after the chosen number of sampling steps. Gated entries use runtime LoRA regardless of the stack mode; ordinary linear LoRAs are supported, including mixed-precision layers.",
+			inputs=[
+				QUANTIZED_LORA_IO.Input("lora"),
+				io.Int.Input(
+					"active_steps", default=2, min=0, max=10000,
+					tooltip="Active for the first N intervals of the sampler's actual sigma schedule. 0 disables this entry. Each sampling invocation starts a fresh gate; intermediate solver evaluations use the same sigma boundary.",
+				),
+			],
+			outputs=[QUANTIZED_LORA_IO.Output(display_name="lora")],
+		)
+
+	@classmethod
+	def execute(cls, lora, active_steps):
+		if not isinstance(active_steps, int) or active_steps < 0:
+			raise ValueError("LoRA Gate active_steps must be a nonnegative integer.")
+		return io.NodeOutput(QuantizedLoraSpec(lora.path, lora.strength, active_steps))
+
+
 class QuantizedLoraPatcher(io.ComfyNode):
 	@classmethod
 	def define_schema(cls):
@@ -426,14 +452,25 @@ class QuantizedLoraPatcher(io.ComfyNode):
 
 	@classmethod
 	def execute(cls, model, mode, loras=None):
-		lora_entries = _collect_autogrow_lora_entries(loras)
-		return INT8LoraLoaderStack().apply_loras(mode, model, lora_entries)
+		# ComfyUI may retain entry outputs created before scheduling was added.
+		ungated = {name: lora for name, lora in (loras or {}).items() if getattr(lora, "active_steps", None) is None}
+		lora_entries = _collect_autogrow_lora_entries(ungated)
+		result = INT8LoraLoaderStack().apply_loras(mode, model, lora_entries)
+		gated = [lora for lora in (loras or {}).values() if getattr(lora, "active_steps", None) is not None and lora.active_steps > 0 and lora.strength != 0]
+		if gated:
+			from .int8_dynamic_lora import INT8DynamicLoraStack
+			result = INT8DynamicLoraStack().apply_loras(
+				result[0], [(lora.path, lora.strength) for lora in gated],
+				active_steps=[lora.active_steps for lora in gated],
+			)
+		return result
 
 
 NODE_CLASS_MAPPINGS = {
 	"INT8LoraLoader": INT8LoraLoader,
 	"INT8LoraLoaderStack": INT8LoraLoaderStack,
 	"QuantizedLoraConfig": QuantizedLoraConfig,
+	"QuantizedLoraGate": QuantizedLoraGate,
 	"QuantizedLoraPatcher": QuantizedLoraPatcher,
 }
 
@@ -441,5 +478,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 	"INT8LoraLoader": "Load LoRA (Quantized)",
 	"INT8LoraLoaderStack": "Load LoRA Stack (Quantized)",
 	"QuantizedLoraConfig": "LoRA Stack Entry (Quantized)",
+	"QuantizedLoraGate": "LoRA Gate (Quantized)",
 	"QuantizedLoraPatcher": "Apply LoRA Stack (Quantized)",
 }

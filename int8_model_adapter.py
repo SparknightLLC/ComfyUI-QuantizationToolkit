@@ -39,6 +39,7 @@ from .int8_quant import (
 	_prepack_torch_int_mm_weight,
 	_get_int8_compute_device,
 	_is_float8_dtype,
+	_is_linear_like,
 	_outlier_method_uses_hadamard,
 	_rotate_weight_for_outlier_method,
 	configure_int8_module_runtime,
@@ -230,19 +231,6 @@ def _is_comfy_quantized_tensor(value):
 			or hasattr(value, "_layout_cls")
 			or hasattr(value, "params")
 		)
-	)
-
-
-def _is_linear_like(module):
-	if isinstance(module, nn.Linear):
-		return True
-	if module.__class__.__name__ != "Linear":
-		return False
-	return (
-		hasattr(module, "in_features")
-		and hasattr(module, "out_features")
-		and hasattr(module, "weight")
-		and callable(getattr(module, "forward", None))
 	)
 
 

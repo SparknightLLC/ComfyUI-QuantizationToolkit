@@ -1652,6 +1652,19 @@ _NATIVE_DYNAMIC_LORA_HOOK_ATTRIBUTE = "_quantization_toolkit_dynamic_lora_hook"
 _NATIVE_DYNAMIC_LORA_FORMATS = ("int8_tensorwise", "convrot_w4a4")
 
 
+def _is_linear_like(module):
+    if isinstance(module, nn.Linear):
+        return True
+    if module.__class__.__name__ != "Linear":
+        return False
+    return (
+        hasattr(module, "in_features")
+        and hasattr(module, "out_features")
+        and hasattr(module, "weight")
+        and callable(getattr(module, "forward", None))
+    )
+
+
 def _is_native_dynamic_lora_module(module):
     return bool(
         getattr(module, "quant_format", None) in _NATIVE_DYNAMIC_LORA_FORMATS
@@ -1679,8 +1692,14 @@ def _native_dynamic_lora_forward_hook(module, input_args, input_kwargs, output):
     )
 
 
-def _ensure_native_dynamic_lora_runtime(module):
-    if not _is_native_dynamic_lora_module(module):
+def _ensure_native_dynamic_lora_runtime(module, allow_linear=False):
+    if getattr(module, "_is_quantized", False):
+        return False
+    if not (
+        _is_native_dynamic_lora_module(module)
+        or hasattr(module, _NATIVE_DYNAMIC_LORA_HOOK_ATTRIBUTE)
+        or (allow_linear and _is_linear_like(module) and not hasattr(module, "lora_A"))
+    ):
         return False
 
     if not hasattr(module, _NATIVE_DYNAMIC_LORA_HOOK_ATTRIBUTE):
@@ -1902,6 +1921,7 @@ class DynamicLoRAHook:
 
         # Pre-group patches by layer
         layer_patches = {}
+        gated_modules = set()
         if dynamic_loras:
             for entry in dynamic_loras:
                 strength = entry["strength"]
@@ -1909,6 +1929,8 @@ class DynamicLoRAHook:
                     normalized_key = normalize_patch_key(key)
                     if normalized_key is None:
                         continue
+                    if "active_steps" in entry:
+                        gated_modules.add(normalized_key)
                     offset = key[1] if isinstance(key, tuple) and len(key) > 1 else None
                     if normalized_key not in layer_patches:
                         layer_patches[normalized_key] = []
@@ -1919,7 +1941,10 @@ class DynamicLoRAHook:
         matched_modules = 0
         native_runtime_modules = 0
         for name, module in _iter_dynamic_lora_modules(diffusion_model):
-            uses_native_dynamic_runtime = _ensure_native_dynamic_lora_runtime(module)
+            normalized_name = normalize_module_name(name)
+            uses_native_dynamic_runtime = _ensure_native_dynamic_lora_runtime(
+                module, allow_linear=normalized_name in gated_modules,
+            )
             if uses_native_dynamic_runtime:
                 native_runtime_modules += 1
 
@@ -1927,7 +1952,6 @@ class DynamicLoRAHook:
                 continue
             candidate_modules += 1
             
-            normalized_name = normalize_module_name(name)
             patches = layer_patches.get(normalized_name)
             
             if not patches:
@@ -1941,6 +1965,8 @@ class DynamicLoRAHook:
             matched_modules += 1
             entries = []
             module_outlier_method = _get_module_outlier_method(module)
+            if uses_native_dynamic_runtime or not getattr(module, "_is_quantized", False):
+                module_outlier_method = OUTLIER_METHOD_NONE
             hadanorm_sigma = getattr(module, "hadanorm_sigma", None)
             for adapter, strength, offset in patches:
                 if not _LORA_ADAPTER_AVAILABLE or not isinstance(adapter, LoRAAdapter):
@@ -2733,7 +2759,11 @@ if _COMFY_OPS_AVAILABLE:
                 
                 if not self._is_quantized:
                     with CastBiasWeightContext(self, x, offloadable=True) as (weight, bias):
-                        return F.linear(x, weight, bias)
+                        out = F.linear(x, weight, bias)
+                    return apply_dynamic_lora_delta(
+                        x_input=x, y=out, lora_A=self.lora_A, lora_B=self.lora_B,
+                        lora_alpha=self.lora_alpha, lora_entries=self.dynamic_lora_entries, device=x.device,
+                    )
 
                 if self._quant_format == "convrot_w4a4":
                     with CastBiasWeightContext(
@@ -2768,7 +2798,11 @@ if _COMFY_OPS_AVAILABLE:
                         compute_dtype=x.dtype,
                         want_requant=True,
                     ) as (weight, bias):
-                        return native_w4a8_linear(x, weight, bias)
+                        out = native_w4a8_linear(x, weight, bias)
+                    return apply_dynamic_lora_delta(
+                        x_input=x, y=out, lora_A=self.lora_A, lora_B=self.lora_B,
+                        lora_alpha=self.lora_alpha, lora_entries=self.dynamic_lora_entries, device=x.device,
+                    )
                 
                 # 1. Move weight/bias/scale to device (non_blocking)
                 weight = self.weight if self.weight.device == x.device else self.weight.to(x.device, non_blocking=True)

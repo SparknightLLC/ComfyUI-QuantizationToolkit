@@ -85,7 +85,7 @@ except ImportError:
 # Wrap imports in try/except to prevent total failure if dependencies are missing
 try:
     from .int8_unet_loader import UNetLoaderINTW8A8
-    from .int8_lora import INT8LoraLoader, INT8LoraLoaderStack, QuantizedLoraConfig, QuantizedLoraPatcher
+    from .int8_lora import INT8LoraLoader, INT8LoraLoaderStack, QuantizedLoraConfig, QuantizedLoraGate, QuantizedLoraPatcher
     from .int8_kernel_config_node import INT8KernelConfigTuner
     from .int8_model_adapter import INT8ModelAdapter
     from .int8_model_save import INT8ModelSave
@@ -99,6 +99,7 @@ try:
         "INT8LoraLoader": INT8LoraLoader,
         "INT8LoraLoaderStack": INT8LoraLoaderStack,
         "QuantizedLoraConfig": QuantizedLoraConfig,
+        "QuantizedLoraGate": QuantizedLoraGate,
         "QuantizedLoraPatcher": QuantizedLoraPatcher,
         "INT8KernelConfigTuner": INT8KernelConfigTuner,
     }
@@ -111,6 +112,7 @@ try:
         "INT8LoraLoader": "Load LoRA (Quantized)",
         "INT8LoraLoaderStack": "Load LoRA Stack (Quantized)",
         "QuantizedLoraConfig": "LoRA Stack Entry (Quantized)",
+        "QuantizedLoraGate": "LoRA Gate (Quantized)",
         "QuantizedLoraPatcher": "Apply LoRA Stack (Quantized)",
         "INT8KernelConfigTuner": "INT8 Kernel Config",
     }

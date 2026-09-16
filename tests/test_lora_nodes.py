@@ -28,6 +28,7 @@ class QuantizedLoraNodeTests(unittest.TestCase):
 			"INT8LoraLoader": "Load LoRA (Quantized)",
 			"INT8LoraLoaderStack": "Load LoRA Stack (Quantized)",
 			"QuantizedLoraConfig": "LoRA Stack Entry (Quantized)",
+			"QuantizedLoraGate": "LoRA Gate (Quantized)",
 			"QuantizedLoraPatcher": "Apply LoRA Stack (Quantized)",
 		}
 

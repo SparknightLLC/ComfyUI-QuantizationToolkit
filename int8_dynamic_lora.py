@@ -4,6 +4,9 @@ import comfy.lora
 import comfy.patcher_extension
 import logging
 import uuid
+import torch
+
+from .int8_quant import _is_linear_like
 
 from .int8_lora_patching import (
     LoRAAdapter,
@@ -33,11 +36,45 @@ def _is_dynamic_compatible_adapter(adapter):
     return dora_scale is None and reshape is None
 
 
-def _partition_dynamic_patches(model_patcher, patch_dict, module_cache):
+def _partition_dynamic_patches(model_patcher, patch_dict, module_cache, require_runtime=False):
     dynamic_patch_dict = {}
     static_patch_dict = {}
 
     for key, adapter in patch_dict.items():
+        if require_runtime:
+            target_module = _resolve_target_module_cached(model_patcher, key, module_cache)
+            weight_key = key[0] if isinstance(key, tuple) else key
+            if (
+                not _is_dynamic_compatible_adapter(adapter)
+                or not _is_linear_like(target_module)
+                or not weight_key.endswith(".weight")
+                or adapter.weights[0].ndim != 2
+                or adapter.weights[1].ndim != 2
+                or adapter.weights[3] is not None
+                or (isinstance(key, tuple) and len(key) > 2)
+            ):
+                raise ValueError(f"LoRA Gate requires ordinary linear LoRA patches; unsupported target: {weight_key}")
+            input_features = target_module.in_features
+            output_features = target_module.out_features
+            offset = key[1] if isinstance(key, tuple) else None
+            if offset is not None:
+                if (
+                    not isinstance(offset, (tuple, list)) or len(offset) != 3
+                    or any(not isinstance(value, int) for value in offset)
+                    or offset[0] not in (0, 1) or offset[1] < 0 or offset[2] <= 0
+                    or offset[1] + offset[2] > (output_features if offset[0] == 0 else input_features)
+                ):
+                    raise ValueError(f"LoRA Gate: unsupported linear offset for {weight_key}")
+                if offset[0] == 0:
+                    output_features = offset[2]
+                else:
+                    input_features = offset[2]
+            up, down = adapter.weights[:2]
+            if up.shape[0] != output_features or down.shape[1] != input_features or up.shape[1] != down.shape[0]:
+                raise ValueError(f"LoRA Gate: incompatible linear LoRA dimensions for {weight_key}")
+            dynamic_patch_dict[key] = adapter
+            continue
+
         if not _is_dynamic_compatible_adapter(adapter):
             static_patch_dict[key] = adapter
             continue
@@ -69,12 +106,27 @@ def _warn_if_w4a8_dynamic_fallback(model_patcher):
         )
 
 
-def _dynamic_lora_sync_wrapper(executor, *args, **kwargs):
-    transformer_options = kwargs.get("transformer_options", None)
-    if transformer_options is None and len(args) > 5:
-        transformer_options = args[5]
+def _dynamic_lora_sync_wrapper(executor, x, t, c_concat=None, c_crossattn=None, control=None, transformer_options=None, **kwargs):
     if transformer_options is None:
         transformer_options = {}
+
+    dynamic_loras = transformer_options.get("dynamic_loras", [])
+    if any("active_steps" in entry for entry in dynamic_loras):
+        sigmas = transformer_options.get("sample_sigmas")
+        if sigmas is None or len(sigmas) < 2:
+            raise ValueError("LoRA Gate requires a sampler that supplies sample_sigmas in transformer_options.")
+        sigma = float(t.flatten()[0])
+        if not bool(torch.all(t == t.flatten()[0])):
+            raise ValueError("LoRA Gate does not support mixed timesteps in one model batch.")
+        transformer_options = transformer_options.copy()
+        transformer_options["dynamic_loras"] = [
+            entry for entry in dynamic_loras
+            if "active_steps" not in entry
+            or (entry["active_steps"] > 0 and (
+                entry["active_steps"] >= len(sigmas) - 1
+                or sigma > float(sigmas[entry["active_steps"]])
+            ))
+        ]
 
     base_model = executor.class_obj
     diffusion_model = getattr(base_model, "diffusion_model", None)
@@ -82,7 +134,7 @@ def _dynamic_lora_sync_wrapper(executor, *args, **kwargs):
         from .int8_quant import DynamicLoRAHook
         DynamicLoRAHook.sync_from_transformer_options(diffusion_model, transformer_options)
 
-    return executor(*args, **kwargs)
+    return executor(x, t, c_concat, c_crossattn, control, transformer_options, **kwargs)
 
 def _ensure_dynamic_sync_wrapper(model_patcher):
     model_patcher.remove_wrappers_with_key(comfy.patcher_extension.WrappersMP.APPLY_MODEL, _DYNAMIC_LORA_WRAPPER_KEY)
@@ -194,13 +246,14 @@ class INT8DynamicLoraStack:
 
         return self.apply_loras(model, lora_entries)
 
-    def apply_loras(self, model, lora_entries):
+    def apply_loras(self, model, lora_entries, active_steps=None):
 
         if not lora_entries:
             return (model,)
 
         model_patcher = model.clone()
-        _warn_if_w4a8_dynamic_fallback(model_patcher)
+        if active_steps is None:
+            _warn_if_w4a8_dynamic_fallback(model_patcher)
 
         key_map = _get_key_map(model_patcher)
 
@@ -220,16 +273,19 @@ class INT8DynamicLoraStack:
         dynamic_patch_count = 0
         static_patch_count = 0
 
-        for lora_name, strength in lora_entries:
+        for index, (lora_name, strength) in enumerate(lora_entries):
             lora_path = folder_paths.get_full_path("loras", lora_name)
             lora_data = comfy.utils.load_torch_file(lora_path, safe_load=True)
             patch_dict = comfy.lora.load_lora(lora_data, key_map, log_missing=True)
             del lora_data
 
+            if active_steps is not None and not patch_dict:
+                raise ValueError(f"LoRA Gate: no model patches matched {lora_name}.")
             dynamic_patch_dict, static_patch_dict = _partition_dynamic_patches(
                 model_patcher,
                 patch_dict,
                 module_cache,
+                require_runtime=active_steps is not None,
             )
             del patch_dict
             dynamic_patch_count += len(dynamic_patch_dict)
@@ -242,6 +298,8 @@ class INT8DynamicLoraStack:
                     "patches": dynamic_patch_dict,
                     "patch_uuid": uuid.uuid4().hex,
                 })
+                if active_steps is not None:
+                    opts["dynamic_loras"][-1]["active_steps"] = active_steps[index]
 
             if static_patch_dict:
                 wrapped_static = _wrap_static_int8_patches(
@@ -251,7 +309,10 @@ class INT8DynamicLoraStack:
                 )
                 model_patcher.add_patches(wrapped_static, strength)
 
-            _append_lora_signature(model_patcher, "Dynamic", lora_name, strength)
+            _append_lora_signature(
+                model_patcher, "Dynamic", lora_name, strength,
+                active_steps=None if active_steps is None else active_steps[index],
+            )
 
         logging.info(
             f"Quantization Toolkit LoRA stack (Dynamic): loaded {len(lora_entries)} LoRAs in a single pass "

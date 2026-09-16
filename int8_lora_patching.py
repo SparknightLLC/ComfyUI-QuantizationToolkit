@@ -29,7 +29,7 @@ def _get_lora_signature(model_patcher):
 	return signature if isinstance(signature, tuple) else ()
 
 
-def _append_lora_signature(model_patcher, mode, lora_name, strength, seed=None):
+def _append_lora_signature(model_patcher, mode, lora_name, strength, seed=None, active_steps=None):
 	if not hasattr(model_patcher, "set_attachments"):
 		return
 
@@ -40,6 +40,8 @@ def _append_lora_signature(model_patcher, mode, lora_name, strength, seed=None):
 	)
 	if seed is not None:
 		entry = entry + (int(seed),)
+	if active_steps is not None:
+		entry = entry + (("active_steps", active_steps),)
 
 	model_patcher.set_attachments(
 		INT8_LORA_SIGNATURE_ATTACHMENT_KEY,
