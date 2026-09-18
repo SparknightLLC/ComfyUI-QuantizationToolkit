@@ -742,7 +742,9 @@ def _make_lazy_compile_wrapper(compile_key_list, compile_kwargs, verbose):
 			for key, (_source_module, module) in compiled_modules.items():
 				original_modules[key] = comfy.utils.get_attr(executor.class_obj, key)
 				comfy.utils.set_attr(executor.class_obj, key, module)
-			result = executor(*args, **kwargs)
+			# Gated LoRAs can attach runtime hooks after an earlier graph was compiled.
+			with torch._dynamo.config.patch(skip_nnmodule_hook_guards=False):
+				result = executor(*args, **kwargs)
 		finally:
 			for key, module in original_modules.items():
 				comfy.utils.set_attr(executor.class_obj, key, module)

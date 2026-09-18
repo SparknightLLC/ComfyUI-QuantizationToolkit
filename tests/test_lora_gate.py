@@ -20,6 +20,7 @@ import comfy.patcher_extension
 lora_nodes = importlib.import_module(f"{PACKAGE_NAME}.int8_lora")
 lora_dynamic = importlib.import_module(f"{PACKAGE_NAME}.int8_dynamic_lora")
 quant = importlib.import_module(f"{PACKAGE_NAME}.int8_quant")
+lazy_compile = importlib.import_module(f"{PACKAGE_NAME}.int8_lazy_compile")
 
 
 class GateDiffusionModel(torch.nn.Module):
@@ -144,6 +145,54 @@ class QuantizedLoraGateTests(unittest.TestCase):
 	def test_missing_schedule_fails_explicitly(self):
 		with self.assertRaisesRegex(ValueError, "sample_sigmas"):
 			lora_dynamic._dynamic_lora_sync_wrapper(None, torch.zeros(1), torch.ones(1), transformer_options={"dynamic_loras": [{"active_steps": 2}]})
+
+	def test_gate_added_after_compilation_applies_runtime_delta(self):
+		for layer_kind in ("float", "comfy_mixed_float"):
+			with self.subTest(layer=layer_kind):
+				torch._dynamo.reset()
+				if layer_kind == "float":
+					layer = torch.nn.Linear(4, 3, bias=False)
+				else:
+					layer = comfy.ops.mixed_precision_ops(compute_dtype=torch.float32).Linear(4, 3, bias=False)
+				layer.load_state_dict({"weight": torch.ones(3, 4)})
+				model = GateDiffusionModel(layer)
+				executor = GateExecutor(model)
+				graph_count = 0
+
+				def counting_backend(graph, _inputs):
+					nonlocal graph_count
+					graph_count += 1
+					return graph.forward
+
+				compile_wrapper = lazy_compile._make_lazy_compile_wrapper(
+					["diffusion_model.layer"],
+					{"backend": counting_backend, "fullgraph": True},
+					False,
+				)
+				wrapped = comfy.patcher_extension.WrapperExecutor.new_class_executor(
+					executor.__call__, executor.class_obj,
+					[lora_dynamic._dynamic_lora_sync_wrapper, compile_wrapper],
+				)
+				x = torch.ones(1, 4)
+				sigmas = torch.tensor([1.0, 0.8, 0.6, 0.4, 0.2, 0])
+				opts = {"sample_sigmas": sigmas}
+				base = wrapped.execute(x, torch.ones(1), None, None, None, opts).detach().clone()
+				warm_graph_count = graph_count
+				adapter = quant.LoRAAdapter([], (torch.ones(3, 1), torch.ones(1, 4), None, None, None, None))
+				entry = {"patches": {"diffusion_model.layer.weight": adapter}, "strength": 1.0, "patch_uuid": "late_gate", "active_steps": 5}
+				opts["dynamic_loras"] = [entry]
+				for sigma in sigmas[:-1]:
+					actual = wrapped.execute(x, sigma[None], None, None, None, opts)
+					torch.testing.assert_close(actual, base + 4)
+				self.assertGreater(graph_count, warm_graph_count)
+				active_graph_count = graph_count
+				wrapped.execute(x, torch.ones(1), None, None, None, opts)
+				self.assertEqual(graph_count, active_graph_count)
+				entry["active_steps"] = 2
+				actual = wrapped.execute(x, sigmas[2:3], None, None, None, opts)
+				torch.testing.assert_close(actual, base)
+				actual = wrapped.execute(x, torch.ones(1), None, None, None, opts)
+				torch.testing.assert_close(actual, base + 4)
 
 	def test_fused_slices_gate_without_changing_other_outputs(self):
 		for offset in ((0, 1, 2), (1, 1, 2)):
