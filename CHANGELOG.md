@@ -2,7 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
-<details open><summary>2.2.2 - 13 August 2026</summary>
+<details open><summary>2.3.0 - 27 September 2026</summary>
+
+### Added
+
+- Torch compilation support for Qwen Image using compatibility shim
+
+</details>
+
+<details><summary>2.2.2 - 13 August 2026</summary>
 
 ### Changed
 
