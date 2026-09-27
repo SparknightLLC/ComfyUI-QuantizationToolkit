@@ -61,7 +61,7 @@ class QuantizedLoraGateTests(unittest.TestCase):
 		del entry.active_steps
 		with mock.patch.object(lora_nodes.INT8LoraLoaderStack, "apply_loras", return_value=("patched",)) as apply:
 			self.assertEqual(lora_nodes.QuantizedLoraPatcher.execute("model", "Stochastic", {"lora_1": entry}), ("patched",))
-		apply.assert_called_once_with("Stochastic", "model", [("cached.safetensors", 0.75)])
+		apply.assert_called_once_with("Stochastic", "model", [("cached.safetensors", 0.75)], pool_stochastic_stacks=False)
 
 	def test_stack_routes_only_gated_entries_to_runtime(self):
 		entries = {
@@ -71,7 +71,7 @@ class QuantizedLoraGateTests(unittest.TestCase):
 		with mock.patch.object(lora_nodes.INT8LoraLoaderStack, "apply_loras", return_value=("style_model",)) as ordinary:
 			with mock.patch.object(lora_dynamic.INT8DynamicLoraStack, "apply_loras", return_value=("gated_model",)) as runtime:
 				result = lora_nodes.QuantizedLoraPatcher.execute("base", "Stochastic", entries)
-		ordinary.assert_called_once_with("Stochastic", "base", [("style", 0.5)])
+		ordinary.assert_called_once_with("Stochastic", "base", [("style", 0.5)], pool_stochastic_stacks=False)
 		runtime.assert_called_once_with("style_model", [("sda", 1)], active_steps=[2])
 		self.assertEqual(result, ("gated_model",))
 

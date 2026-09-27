@@ -9,11 +9,13 @@ from comfy_api.latest import io
 from .int8_lora_patching import (
 	_append_lora_signature,
 	_can_merge_stochastic_stack,
+	_create_pooled_stochastic_patch,
 	_create_stochastic_stack_adapter,
 	_get_key_map,
 	_get_supported_quantization_format,
 	_get_weight_scale_for_module,
 	_is_additive_stochastic_patch,
+	_merge_pooled_stochastic_patch,
 	_model_has_supported_quantized_modules,
 	_model_has_int4_modules,
 	_model_has_w4a8_modules,
@@ -232,7 +234,7 @@ class INT8LoraLoaderStack:
 		lora_entries = _collect_lora_entries(kwargs)
 		return self.apply_loras(mode, model, lora_entries, seed=seed)
 
-	def apply_loras(self, mode, model, lora_entries, seed=318008):
+	def apply_loras(self, mode, model, lora_entries, seed=318008, pool_stochastic_stacks=False):
 		if not lora_entries:
 			return (model,)
 
@@ -241,6 +243,12 @@ class INT8LoraLoaderStack:
 			mode,
 			_summarize_lora_entries(lora_entries),
 		)
+
+		if pool_stochastic_stacks and mode != LORA_MODE_STOCHASTIC:
+			logging.info(
+				"Quantization Toolkit LoRA stack (%s): pooling only applies to Stochastic mode.",
+				mode,
+			)
 
 		if mode == LORA_MODE_DYNAMIC:
 			return _dispatch_dynamic_stack(model, lora_entries)
@@ -259,7 +267,7 @@ class INT8LoraLoaderStack:
 		if mode == LORA_MODE_STANDARD:
 			return _dispatch_standard_stack(model, lora_entries, seed=seed)
 
-		if len(lora_entries) == 1:
+		if len(lora_entries) == 1 and not pool_stochastic_stacks:
 			lora_name, strength = lora_entries[0]
 			return INT8LoraLoader().load_lora(LORA_MODE_STOCHASTIC, model, lora_name, strength, seed=seed)
 
@@ -334,7 +342,25 @@ class INT8LoraLoaderStack:
 				outlier_method = getattr(target_module, "_outlier_method", None)
 				hadanorm_sigma = getattr(target_module, "hadanorm_sigma", None)
 				mergeable = all(hasattr(adapter, "calculate_weight") for adapter, _ in patches)
-				if mergeable:
+				if mergeable and pool_stochastic_stacks:
+					if _merge_pooled_stochastic_patch(
+						model_patcher,
+						key,
+						patches,
+						weight_scale,
+						seed=seed,
+						outlier_method=outlier_method,
+						hadanorm_sigma=hadanorm_sigma,
+					):
+						continue
+					final_patch_dict[key] = _create_pooled_stochastic_patch(
+						patches,
+						weight_scale,
+						seed=seed,
+						outlier_method=outlier_method,
+						hadanorm_sigma=hadanorm_sigma,
+					)
+				elif mergeable:
 					final_patch_dict[key] = _create_stochastic_stack_adapter(
 						patches,
 						weight_scale,
@@ -439,6 +465,11 @@ class QuantizedLoraPatcher(io.ComfyNode):
 					default=LORA_MODE_STOCHASTIC,
 					tooltip="Standard uses ComfyUI patching. Stochastic requantizes patched weights. Dynamic preserves runtime deltas on INT8/W4A4 and warns before using Standard fallback on W4A8.",
 				),
+				io.Boolean.Input(
+					"pool_stochastic_stacks",
+					default=False,
+					tooltip="Off quantizes this stack independently, as before. On defers the merge: candidates from every pooled Apply LoRA Stack are combined and requantized once, just before inference. Stochastic mode only.",
+				),
 				io.Model.Input("model", tooltip="Quantized or floating-point diffusion model to receive the LoRAs."),
 				io.Autogrow.Input(
 					"loras",
@@ -451,11 +482,16 @@ class QuantizedLoraPatcher(io.ComfyNode):
 		)
 
 	@classmethod
-	def execute(cls, model, mode, loras=None):
+	def execute(cls, model, mode, loras=None, pool_stochastic_stacks=False):
 		# ComfyUI may retain entry outputs created before scheduling was added.
 		ungated = {name: lora for name, lora in (loras or {}).items() if getattr(lora, "active_steps", None) is None}
 		lora_entries = _collect_autogrow_lora_entries(ungated)
-		result = INT8LoraLoaderStack().apply_loras(mode, model, lora_entries)
+		result = INT8LoraLoaderStack().apply_loras(
+			mode,
+			model,
+			lora_entries,
+			pool_stochastic_stacks=pool_stochastic_stacks,
+		)
 		gated = [lora for lora in (loras or {}).values() if getattr(lora, "active_steps", None) is not None and lora.active_steps > 0 and lora.strength != 0]
 		if gated:
 			from .int8_dynamic_lora import INT8DynamicLoraStack

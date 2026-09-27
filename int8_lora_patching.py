@@ -17,6 +17,7 @@ except Exception:
 
 
 INT8_LORA_SIGNATURE_ATTACHMENT_KEY = "int8_lora_signature"
+POOLED_STOCHASTIC_PATCH_ATTRIBUTE = "_quantization_toolkit_pooled_stochastic_patch"
 W4A8_QUANTIZATION_FORMAT = "asym_w4a8_int8"
 SUPPORTED_QUANTIZATION_FORMATS = ("int8_tensorwise", "convrot_w4a4", W4A8_QUANTIZATION_FORMAT)
 NATIVE_REQUANTIZATION_FORMATS = ("convrot_w4a4", W4A8_QUANTIZATION_FORMAT)
@@ -249,6 +250,70 @@ def _create_stochastic_stack_adapter(patches, weight_scale, seed, outlier_method
 		return _mark_deferred_int8_patch(merged_adapter)
 
 	return merged_adapter
+
+
+def _mark_pooled_stochastic_patch(adapter):
+	setattr(adapter, POOLED_STOCHASTIC_PATCH_ATTRIBUTE, True)
+	return adapter
+
+
+def _is_pooled_stochastic_patch(adapter):
+	return bool(getattr(adapter, POOLED_STOCHASTIC_PATCH_ATTRIBUTE, False))
+
+
+def _create_pooled_stochastic_patch(patches, weight_scale, seed, outlier_method=None, hadanorm_sigma=None):
+	return _mark_pooled_stochastic_patch(
+		_create_stochastic_stack_adapter(
+			patches,
+			weight_scale,
+			seed,
+			outlier_method=outlier_method,
+			hadanorm_sigma=hadanorm_sigma,
+		)
+	)
+
+
+def _collect_pooled_stochastic_candidates(adapter):
+	if not _is_pooled_stochastic_patch(adapter):
+		return None
+	return list(getattr(adapter, "patches", ()))
+
+
+def _merge_pooled_stochastic_patch(model_patcher, key, candidates, weight_scale, seed, outlier_method=None, hadanorm_sigma=None):
+	"""Fold one node's candidates into this patcher's pooled patch for a layer.
+
+	Returns True when a pooled patch already owned the layer. The patch is rebuilt
+	rather than mutated so sibling MODEL branches keep their own patch lists.
+	"""
+	entries = model_patcher.patches.get(key)
+	if not entries:
+		return False
+
+	pooled_candidates = []
+	pooled_index = None
+	retained_entries = []
+	for entry in entries:
+		entry_candidates = _collect_pooled_stochastic_candidates(entry[1])
+		if entry_candidates is None:
+			retained_entries.append(entry)
+			continue
+		if pooled_index is None:
+			pooled_index = len(retained_entries)
+		pooled_candidates.extend(entry_candidates)
+
+	if pooled_index is None:
+		return False
+
+	merged_adapter = _create_pooled_stochastic_patch(
+		pooled_candidates + list(candidates),
+		weight_scale,
+		seed,
+		outlier_method=outlier_method,
+		hadanorm_sigma=hadanorm_sigma,
+	)
+	retained_entries.insert(pooled_index, (1.0, merged_adapter, 1.0, None, None))
+	model_patcher.patches[key] = retained_entries
+	return True
 
 
 def _model_has_supported_quantized_modules(model_patcher):

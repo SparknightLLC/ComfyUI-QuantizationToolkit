@@ -50,7 +50,7 @@ class QuantizedLoraNodeTests(unittest.TestCase):
 		input_types = lora_nodes.QuantizedLoraPatcher.INPUT_TYPES()
 		autogrow = input_types["optional"]["loras"][1]
 
-		self.assertEqual(list(input_types["required"]), ["mode", "model"])
+		self.assertEqual(list(input_types["required"]), ["mode", "pool_stochastic_stacks", "model"])
 		self.assertEqual(autogrow["template"]["min"], 0)
 		self.assertEqual(autogrow["template"]["names"][0], "lora_1")
 		self.assertEqual(autogrow["template"]["names"][-1], "lora_100")
@@ -79,6 +79,7 @@ class QuantizedLoraNodeTests(unittest.TestCase):
 			lora_nodes.LORA_MODE_DYNAMIC,
 			model,
 			[("first.safetensors", 0.5), ("third.safetensors", -1.0)],
+			pool_stochastic_stacks=False,
 		)
 
 	def test_lora_entry_summary_reports_effective_paths_and_strengths(self):

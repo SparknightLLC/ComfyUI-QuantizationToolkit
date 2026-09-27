@@ -40,6 +40,8 @@ Dynamic LoRAs retain their factors and add matrix multiplications to each affect
 
 On mixed-precision models, Dynamic mode applies unsupported targets through ComfyUI's standard patch path so the complete LoRA remains active. This includes W4A8 until a quality-preserving runtime-delta implementation is available.
 
+Each `Apply LoRA Stack (Quantized)` node in `Stochastic` mode quantizes the layers it touches once. An unpooled layer therefore sees one stochastic rounding step per apply node that patches it, and a later stack starts from the earlier stack's rounded integer weight. Enable `pool_stochastic_stacks` on those nodes to fold the candidates from every pooled apply node into one patch list per layer, so the layer is quantized once for the whole group. Pooling does not change float, native W4A4/W4A8, or `Dynamic` behavior: native layouts already aggregate their patch list before a single requantization, and `Dynamic` deltas are applied at runtime.
+
 ## Lazy Torch Compile
 
 Place `Quantized Lazy Torch Compile` after quantization and quantized LoRAs:
@@ -65,6 +67,8 @@ The Toolkit shares compatible compiled dispatchers between repeated transformer 
 Native ConvRot INT4 compiler support varies with ComfyUI and comfy-kitchen versions. The Toolkit probes for an upstream compiler-safe operator and otherwise supplies a temporary opaque boundary. If neither path is available, it returns the model uncompiled with a detailed warning instead of failing during sampling.
 
 Upstream W4A8 dispatch currently enters its native kernel through Python backend selection and DLPack, which FakeTensor cannot trace directly. The Toolkit supplies a temporary opaque `torch.library` custom operator with FakeTensor metadata so the surrounding transformer graph can still compile while eager inference continues to use the ordinary native layout dispatch. If the compatibility operator cannot be registered, the lazy compile node returns an uncompiled MODEL with a detailed warning.
+
+Qwen Image 2.1 edit runs cache text and reference K/V in a cross-step cache (`Qwen Image 2.1 Cache`). When that cache is stored in host RAM, the cache write pins memory from inside the attention callable, which TorchDynamo cannot trace while the transformer blocks are compiled. The Toolkit marks that cache write as a graph break so the host cache keeps working and the blocks still compile, and logs a warning when it does. Set the cache node to `gpu` (cache stays in VRAM) or `off` (prefix is recomputed) before the compile node to skip the shim entirely.
 
 ## Model Saving
 

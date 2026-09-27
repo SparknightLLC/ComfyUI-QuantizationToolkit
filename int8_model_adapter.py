@@ -92,6 +92,7 @@ _INT8_MODEL_ADAPTER_WRAPPER_KEY = "int8_model_adapter_cache_notice"
 _INT8_MODEL_ADAPTER_ORIGINAL_MODULES_KEY = "int8_model_adapter_original_modules"
 _INT8_MODEL_ADAPTER_OUTPUT_CACHE_KEY = "int8_model_adapter_output_cache"
 _INT8_LORA_SIGNATURE_ATTACHMENT_KEY = "int8_lora_signature"
+_POOLED_STOCHASTIC_PATCH_ATTRIBUTE = "_quantization_toolkit_pooled_stochastic_patch"
 _INT8_MODEL_ADAPTER_LAST_MODEL_REF = None
 _INT8_MODEL_ADAPTER_LAST_MODEL_ID = None
 try:
@@ -439,6 +440,14 @@ def _is_deferred_int8_stochastic_patch(patch_entry):
 	if not isinstance(patch_entry, tuple) or len(patch_entry) < 2:
 		return False
 	return bool(getattr(patch_entry[1], "_int8_defer_until_quantized", False))
+
+
+def _preserve_pooled_stochastic_patch(original_patch, rebuilt_patch):
+	# A pooled patch that lands on a newly quantized module must stay poolable, or a
+	# later pooled Apply LoRA Stack would quantize it a second time.
+	if getattr(original_patch, _POOLED_STOCHASTIC_PATCH_ATTRIBUTE, False):
+		setattr(rebuilt_patch, _POOLED_STOCHASTIC_PATCH_ATTRIBUTE, True)
+	return rebuilt_patch
 
 
 def _build_layer_patch_bake_plan(model_patcher, layer_patch_keys, bake_deferred=False):
@@ -1072,12 +1081,15 @@ def _wrap_existing_int8_patch(q_module, patch_obj, seed):
 
 	if isinstance(patch_obj, INT8MergedLoRAPatchAdapter):
 		return (
-			INT8MergedLoRAPatchAdapter(
-				patch_obj.patches,
-				weight_scale,
-				seed=patch_obj.seed,
-				outlier_method=outlier_method,
-				hadanorm_sigma=hadanorm_sigma,
+			_preserve_pooled_stochastic_patch(
+				patch_obj,
+				INT8MergedLoRAPatchAdapter(
+					patch_obj.patches,
+					weight_scale,
+					seed=patch_obj.seed,
+					outlier_method=outlier_method,
+					hadanorm_sigma=hadanorm_sigma,
+				),
 			),
 			True,
 		)

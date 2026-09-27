@@ -14,6 +14,7 @@ from torch import nn
 from tqdm.auto import tqdm
 
 from . import int4_compile_compat
+from . import qwen_prefix_cache_compile_compat
 from . import w4a8_compile_compat
 
 
@@ -365,6 +366,22 @@ def _has_w4a8_modules(model_patcher):
 	return any(is_w4a8(module) for module in diffusion_model.modules())
 
 
+def _can_use_host_prefix_cache(model):
+	"""Whether this MODEL can drive the Qwen Image 2.1 host K/V cache during sampling.
+
+	The cache write is a host-memory side effect inside the attention callable, so it
+	cannot be traced by TorchDynamo while the cache stores to RAM. `gpu` keeps the
+	cache in VRAM and `off` disables it; both stay out of the host pinning path.
+	"""
+	diffusion_model = getattr(getattr(model, "model", None), "diffusion_model", None)
+	if not callable(getattr(diffusion_model, "select_prefix_cache", None)):
+		return False
+
+	transformer_options = model.model_options.get("transformer_options", {})
+	cache_options = transformer_options.get("qwen_image21_cache", {})
+	return cache_options.get("device", "auto") not in ("gpu", "off")
+
+
 def _get_comfy_kitchen_version():
 	try:
 		return importlib.metadata.version("comfy-kitchen")
@@ -418,6 +435,28 @@ def _build_w4a8_compile_info():
 	return (
 		"Quantized Lazy Torch Compile: W4A8 compile support enabled "
 		f"via {support_label} (comfy-kitchen {_get_comfy_kitchen_version()})."
+	)
+
+
+def _build_qwen_prefix_cache_warning():
+	return (
+		"Quantized Lazy Torch Compile: Qwen Image 2.1 host K/V caching is not torch.compile safe.\n"
+		"  Upstream: the blocks cache text/reference K/V from inside the attention callable, and PoseBranchCache.put\n"
+		"  pins host memory with tensor.nbytes, which has no symbolic-shape implementation.\n"
+		"  Toolkit shim: PoseBranchCache.put is marked as a graph break, so the cache write runs eagerly and the\n"
+		"  blocks still compile. The shim is a runtime monkeypatch of a ComfyUI internal, and stays inert whenever\n"
+		"  the cache is not written.\n"
+		"  Setting the stock Qwen Image 2.1 Cache node to gpu (cache stays in VRAM) or off (prefix is recomputed)\n"
+		"  avoids the shim entirely."
+	)
+
+
+def _build_qwen_prefix_cache_unavailable_warning():
+	return (
+		"Quantized Lazy Torch Compile: Qwen Image 2.1 host K/V caching is not torch.compile safe, and the\n"
+		f"  Toolkit graph-break shim is unavailable ({qwen_prefix_cache_compile_compat.get_install_error()}).\n"
+		"  Expect Dynamo to fail converting the cache write with a TorchRuntimeError traceback per block.\n"
+		"  Set the stock Qwen Image 2.1 Cache node to gpu or off before this node to compile this MODEL."
 	)
 
 
@@ -810,6 +849,12 @@ class INT8LazyTorchCompile:
 			return (model_patcher,)
 		if has_native_int4 and verbose:
 			logging.info(_build_native_int4_compile_info())
+
+		if _can_use_host_prefix_cache(model):
+			if qwen_prefix_cache_compile_compat.install():
+				logging.warning(_build_qwen_prefix_cache_warning())
+			else:
+				logging.warning(_build_qwen_prefix_cache_unavailable_warning())
 
 		cache_key = _build_cache_key(
 			model,

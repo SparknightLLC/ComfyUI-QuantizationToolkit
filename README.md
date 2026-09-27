@@ -98,6 +98,8 @@ Available modes:
 
 The single and fixed-stack nodes remain available as `Load LoRA (Quantized)` and `Load LoRA Stack (Quantized)`.
 
+Set `pool_stochastic_stacks` on the apply node to keep several stacks wired separately while baking them as one: candidates from every apply node with the option enabled are combined and requantized once, just before inference, instead of being quantized stack by stack. The default keeps each apply node's stack independent, which quantizes a layer again for every additional node that touches it. Pooling applies to `Stochastic` mode.
+
 To gate an individual entry while keeping your sampler setup, insert `LoRA Gate (Quantized)`:
 
 ```text
