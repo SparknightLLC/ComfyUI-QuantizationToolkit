@@ -2,7 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
-<details open><summary>2.4.0 - 28 October 2026</summary>
+<details open><summary>2.4.1 - 28 October 2026</summary>
+
+### Fixed
+
+- Preserved live transformer configuration metadata when saving quantized models, preventing MiniMax H3 PDD checkpoints from losing their stacked output-head count and producing mismatched audio/video output shapes after reload.
+
+</details>
+
+<details><summary>2.4.0 - 28 October 2026</summary>
 
 ### Added
 

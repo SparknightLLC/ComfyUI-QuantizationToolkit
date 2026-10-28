@@ -78,6 +78,7 @@ Qwen Image 2.1 edit runs cache text and reference K/V in a cross-step cache (`Qw
 - Unquantized inputs are rejected before ComfyUI loads or patches model weights.
 - Dynamic LoRAs are runtime-only and cannot be serialized. Use Stochastic mode or bake stock LoRAs before quantization.
 - Plain W8A8, ConvRot W8A8, ConvRot W4A4, asymmetric W4A8, and uniform W6A8 layers receive native `.comfy_quant` metadata.
+- The saved file preserves the loaded model's transformer configuration, including architecture settings such as MiniMax H3 PDD output-head counts, so reloading does not have to infer them from packed weight shapes.
 - QuaRot and HadaNorm require the Toolkit loader because ComfyUI core does not implement their activation transforms.
 
 ## Platform Notes

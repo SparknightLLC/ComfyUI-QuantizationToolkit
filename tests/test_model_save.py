@@ -1,4 +1,5 @@
 import importlib
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -60,6 +61,36 @@ class ModelSaveTests(unittest.TestCase):
 				)
 
 				model_save._validate_quantized_model(model_patcher)
+
+	def test_saved_metadata_preserves_live_model_configuration(self):
+		model_patcher = SimpleNamespace(
+			model=SimpleNamespace(
+				model_config=SimpleNamespace(
+					unet_config={
+						"image_model": "minimax_h3",
+						"latents_dim": 24,
+						"pdd_steps": 8,
+						"non_serializable": object(),
+					},
+				),
+			),
+		)
+		metadata = {
+			"config": json.dumps({
+				"vae": {"channels": 3},
+				"transformer": {"custom": "preserved", "pdd_steps": 1},
+			}),
+		}
+
+		model_save._merge_model_config_metadata(model_patcher, metadata)
+		config = json.loads(metadata["config"])
+
+		self.assertEqual(config["vae"], {"channels": 3})
+		self.assertEqual(config["transformer"]["custom"], "preserved")
+		self.assertEqual(config["transformer"]["image_model"], "minimax_h3")
+		self.assertEqual(config["transformer"]["latents_dim"], 24)
+		self.assertEqual(config["transformer"]["pdd_steps"], 8)
+		self.assertNotIn("non_serializable", config["transformer"])
 
 	def test_dynamic_lora_is_rejected(self):
 		quantized_module = torch.nn.Linear(4, 4, bias=False)

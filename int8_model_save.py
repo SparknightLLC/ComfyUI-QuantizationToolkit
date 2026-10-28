@@ -157,6 +157,42 @@ def _resolve_source_metadata(model_patcher):
 	return None
 
 
+def _merge_model_config_metadata(model_patcher, metadata):
+	base_model = getattr(model_patcher, "model", None)
+	model_config = getattr(base_model, "model_config", None)
+	unet_config = getattr(model_config, "unet_config", None)
+	if not isinstance(unet_config, dict):
+		return metadata
+
+	config = {}
+	existing_config = metadata.get("config")
+	if isinstance(existing_config, str):
+		try:
+			parsed_config = json.loads(existing_config)
+			if isinstance(parsed_config, dict):
+				config = parsed_config
+		except (TypeError, ValueError):
+			pass
+	elif isinstance(existing_config, dict):
+		config = dict(existing_config)
+
+	transformer_config = config.get("transformer", {})
+	if not isinstance(transformer_config, dict):
+		transformer_config = {}
+	transformer_config = dict(transformer_config)
+	for key, value in unet_config.items():
+		try:
+			json.dumps(value)
+		except (TypeError, ValueError):
+			continue
+		transformer_config[key] = value
+
+	if transformer_config:
+		config["transformer"] = transformer_config
+		metadata["config"] = json.dumps(config)
+	return metadata
+
+
 def _resolve_patch_target_module(base_model, patch_key):
 	try:
 		return comfy.utils.get_attr(base_model, patch_key)
@@ -390,6 +426,7 @@ class INT8ModelSave:
 		source_metadata = _resolve_source_metadata(model)
 		if isinstance(source_metadata, dict):
 			metadata.update(source_metadata)
+		_merge_model_config_metadata(model, metadata)
 		if not args.disable_metadata:
 			metadata["prompt"] = prompt_info
 			if extra_pnginfo is not None:
