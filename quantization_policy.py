@@ -22,12 +22,27 @@ def normalize_layer_name(name):
 
 def is_int4_compatible_linear(weight):
 	shape = getattr(weight, "shape", ())
+	if not shape and callable(getattr(weight, "get_shape", None)):
+		shape = weight.get_shape()
 	return bool(
 		len(shape) == 2
 		and int(shape[0]) > 1
 		and int(shape[1]) > 1
 		and int(shape[1]) % INT4_CONVROT_GROUP_SIZE == 0
 	)
+
+
+def is_grouped_int8_compatible_linear(weight, bits):
+	shape = getattr(weight, "shape", ())
+	if len(shape) != 2 or int(shape[0]) <= 1 or int(shape[1]) <= 1:
+		return False
+
+	in_features = int(shape[1])
+	if int(bits) == 4:
+		return in_features % INT4_CONVROT_GROUP_SIZE == 0
+	if int(bits) == 6:
+		return in_features % INT4_CONVROT_GROUP_SIZE == 0
+	raise ValueError(f"Grouped INT8 bits must be 4 or 6, got {bits!r}")
 
 
 def _select_evenly(names, count):

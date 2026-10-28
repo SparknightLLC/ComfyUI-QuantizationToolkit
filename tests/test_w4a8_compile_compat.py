@@ -27,12 +27,16 @@ class W4A8CompileCompatTests(unittest.TestCase):
 		except Exception:
 			pass
 
-	def make_quantized_weight(self, dtype=torch.float32, device="cpu"):
+	def make_quantized_weight(self, dtype=torch.float32, device="cpu", bits=4):
+		if bits == 6:
+			return quant.quantize_native_w6a8(
+				torch.randn(16, 256, dtype=dtype, device=device),
+			)
 		return quant.quantize_native_w4a8(
 			torch.randn(16, 256, dtype=dtype, device=device),
 		)
 
-	def make_quantized_module(self):
+	def make_quantized_module(self, bits=4):
 		module = quant.Int8TensorwiseOps.Linear(
 			256,
 			16,
@@ -40,13 +44,14 @@ class W4A8CompileCompatTests(unittest.TestCase):
 			device="cpu",
 			dtype=torch.float32,
 		)
-		q_weight = self.make_quantized_weight()
+		q_weight = self.make_quantized_weight(bits=bits)
 		module.weight = torch.nn.Parameter(q_weight, requires_grad=False)
 		module.weight_scale = None
 		module._is_quantized = True
-		module._quant_format = quant.W4A8_FORMAT
+		module._quant_format = quant.W4A8_FORMAT if bits == 4 else quant.W6A8_FORMAT
 		module._convrot_groupsize = q_weight._params.convrot_groupsize
 		module._w4a8_group_size = q_weight._params.group_size
+		module._grouped_int8_bits = bits
 		module.eval()
 		return module
 
@@ -162,6 +167,22 @@ class W4A8CompileCompatTests(unittest.TestCase):
 	@unittest.skipUnless(compat._toolkit_op is not None, "Toolkit W4A8 compile custom op is unavailable")
 	def test_quantized_module_compiles_fullgraph_with_dynamic_rows(self):
 		module = self.make_quantized_module()
+		compiled_module = torch.compile(module, backend="eager", fullgraph=True, dynamic=True)
+
+		for row_count in (3, 5):
+			with self.subTest(row_count=row_count):
+				x = torch.randn(row_count, 256, dtype=torch.float32)
+				expected = module(x)
+				actual = compiled_module(x)
+
+				torch.testing.assert_close(actual, expected)
+
+	@unittest.skipUnless(
+		compat._toolkit_op is not None and quant._NATIVE_W6A8_AVAILABLE,
+		"Toolkit W6A8 compile support is unavailable",
+	)
+	def test_w6a8_module_compiles_fullgraph_with_dynamic_rows(self):
+		module = self.make_quantized_module(bits=6)
 		compiled_module = torch.compile(module, backend="eager", fullgraph=True, dynamic=True)
 
 		for row_count in (3, 5):

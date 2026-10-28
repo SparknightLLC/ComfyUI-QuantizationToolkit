@@ -33,6 +33,15 @@ except (ImportError, AttributeError):
     AsymW4A8Int8Layout = None
     _NATIVE_W4A8_AVAILABLE = False
 
+try:
+    from comfy.quant_ops import QUANT_ALGOS
+    _NATIVE_W6A8_AVAILABLE = bool(
+        _NATIVE_W4A8_AVAILABLE
+        and "w6a8_int8" in QUANT_ALGOS
+    )
+except (ImportError, AttributeError):
+    _NATIVE_W6A8_AVAILABLE = False
+
 _INT8_FORCE_DISABLE_TORCH_COMPILE = os.environ.get("INT8_FORCE_DISABLE_TORCH_COMPILE", "0") == "1"
 _INT8_FILE_SLICE_LOAD_ENABLED = os.environ.get("INT8_FILE_SLICE_LOAD", "1") != "0"
 _INT8_FILE_SLICE_LOAD_WARNED = False
@@ -139,6 +148,8 @@ QUANTIZATION_MODE_INT8_HADANORM = "int8_hadanorm"
 QUANTIZATION_MODE_INT4_MIXED = "int4_mixed"
 QUANTIZATION_MODE_INT4_FULL = "int4_full"
 QUANTIZATION_MODE_W4A8 = "w4a8"
+QUANTIZATION_MODE_W4A8_MIXED = "w4a8_mixed"
+QUANTIZATION_MODE_W6A8 = "w6a8"
 QUANTIZATION_MODE_CHOICES = [
     QUANTIZATION_MODE_INT8,
     QUANTIZATION_MODE_INT8_CONVROT,
@@ -147,6 +158,8 @@ QUANTIZATION_MODE_CHOICES = [
     QUANTIZATION_MODE_INT4_MIXED,
     QUANTIZATION_MODE_INT4_FULL,
     QUANTIZATION_MODE_W4A8,
+    QUANTIZATION_MODE_W4A8_MIXED,
+    QUANTIZATION_MODE_W6A8,
 ]
 OUTLIER_METHOD_CHOICES = [
     OUTLIER_METHOD_NONE,
@@ -161,8 +174,15 @@ _HADANORM_ALPHA = 0.5
 _HADANORM_EPS = 1e-6
 _INT4_QUANT_GROUP_SIZE = 64
 _W4A8_QUANT_GROUP_SIZE = 16
+_W6A8_QUANT_GROUP_SIZE = 32
 W4A8_FORMAT = "asym_w4a8_int8"
-_W4A8_FORMAT = W4A8_FORMAT
+W6A8_FORMAT = "w6a8_int8"
+GROUPED_INT8_FORMATS = (W4A8_FORMAT, W6A8_FORMAT)
+_GROUPED_INT8_FORMATS = frozenset(GROUPED_INT8_FORMATS)
+_GROUPED_INT8_BITS = {
+    W4A8_FORMAT: 4,
+    W6A8_FORMAT: 6,
+}
 _W4A8_LAYOUT = "AsymW4A8Int8Layout"
 
 try:
@@ -246,6 +266,36 @@ def normalize_quantization_mode(mode) -> str:
         return normalized
     return QUANTIZATION_MODE_INT8
 
+def quantization_mode_grouped_bits(mode) -> int | None:
+    normalized = normalize_quantization_mode(mode)
+    if normalized in (QUANTIZATION_MODE_W4A8, QUANTIZATION_MODE_W4A8_MIXED):
+        return 4
+    if normalized == QUANTIZATION_MODE_W6A8:
+        return 6
+    return None
+
+def quantization_mode_grouped_format(mode) -> str | None:
+    bits = quantization_mode_grouped_bits(mode)
+    if bits == 4:
+        return W4A8_FORMAT
+    if bits == 6:
+        return W6A8_FORMAT
+    return None
+
+def quantization_mode_grouped_group_size(mode) -> int | None:
+    bits = quantization_mode_grouped_bits(mode)
+    if bits == 4:
+        return _W4A8_QUANT_GROUP_SIZE
+    if bits == 6:
+        return _W6A8_QUANT_GROUP_SIZE
+    return None
+
+def quantization_mode_uses_mixed_int8(mode) -> bool:
+    return normalize_quantization_mode(mode) in (
+        QUANTIZATION_MODE_INT4_MIXED,
+        QUANTIZATION_MODE_W4A8_MIXED,
+    )
+
 def quantization_mode_outlier_method(mode) -> str:
     normalized = normalize_quantization_mode(mode)
     return {
@@ -259,6 +309,8 @@ def quantization_mode_is_int4(mode) -> bool:
         QUANTIZATION_MODE_INT4_MIXED,
         QUANTIZATION_MODE_INT4_FULL,
         QUANTIZATION_MODE_W4A8,
+        QUANTIZATION_MODE_W4A8_MIXED,
+        QUANTIZATION_MODE_W6A8,
     )
 
 def native_int4_available() -> bool:
@@ -267,6 +319,9 @@ def native_int4_available() -> bool:
 def native_w4a8_available() -> bool:
     return _NATIVE_W4A8_AVAILABLE
 
+def native_w6a8_available() -> bool:
+    return _NATIVE_W6A8_AVAILABLE
+
 def _is_native_int4_tensor(value) -> bool:
     return bool(
         _NATIVE_INT4_AVAILABLE
@@ -274,12 +329,15 @@ def _is_native_int4_tensor(value) -> bool:
         and getattr(value, "_layout_cls", None) == "TensorCoreConvRotW4A4Layout"
     )
 
-def _is_native_w4a8_tensor(value) -> bool:
+def _is_native_grouped_int8_tensor(value) -> bool:
     return bool(
         _NATIVE_W4A8_AVAILABLE
         and isinstance(value, QuantizedTensor)
         and getattr(value, "_layout_cls", None) == _W4A8_LAYOUT
     )
+
+def _is_native_w4a8_tensor(value) -> bool:
+    return _is_native_grouped_int8_tensor(value)
 
 def _make_native_int4_tensor(qdata, scale, orig_dtype, orig_shape, convrot_groupsize=256, linear_dtype="int4"):
     if not _NATIVE_INT4_AVAILABLE:
@@ -314,7 +372,7 @@ def quantize_native_int4(weight, linear_dtype="int4", stochastic_rounding=0):
         linear_dtype=linear_dtype,
     )
 
-def _make_native_w4a8_tensor(
+def _make_native_grouped_int8_tensor(
     qdata,
     s_rel,
     s_channel,
@@ -322,30 +380,36 @@ def _make_native_w4a8_tensor(
     correction,
     orig_dtype,
     orig_shape,
-    group_size=_W4A8_QUANT_GROUP_SIZE,
+    quant_format,
+    group_size,
     convrot_groupsize=_CONVROT_GROUP_SIZE,
 ):
     if not _NATIVE_W4A8_AVAILABLE:
-        raise RuntimeError("W4A8 requires ComfyUI 0.32.0 or newer with a compatible comfy-kitchen installation")
+        raise RuntimeError("Grouped INT8 quantization requires ComfyUI 0.32.0 or newer with a compatible comfy-kitchen installation")
 
+    bits = _GROUPED_INT8_BITS.get(quant_format)
+    if bits is None:
+        raise ValueError(f"Unsupported grouped INT8 format {quant_format!r}")
+    if bits == 6 and not _NATIVE_W6A8_AVAILABLE:
+        raise RuntimeError("W6A8 requires ComfyUI with compatible comfy-kitchen support")
     if not isinstance(qdata, torch.Tensor) or qdata.dtype != torch.int8:
-        raise ValueError("W4A8 requires a packed INT8 weight tensor")
-    expected_qdata_shape = (int(orig_shape[0]), int(orig_shape[1]) // 2)
+        raise ValueError(f"{quant_format} requires a packed INT8 weight tensor")
+    expected_qdata_shape = (int(orig_shape[0]), int(orig_shape[1]) * bits // 8)
     if tuple(qdata.shape) != expected_qdata_shape:
         raise ValueError(
-            f"W4A8 packed weight must have shape {expected_qdata_shape}, got {tuple(qdata.shape)}"
+            f"{quant_format} packed weight must have shape {expected_qdata_shape}, got {tuple(qdata.shape)}"
         )
     if not isinstance(s_rel, torch.Tensor):
-        raise ValueError("W4A8 requires a weight_s_rel tensor")
+        raise ValueError(f"{quant_format} requires a weight_s_rel tensor")
     float8_dtype = getattr(torch, "float8_e4m3fn", None)
     if s_rel.dtype == torch.uint8:
         if float8_dtype is None:
-            raise RuntimeError("W4A8 FP8 scale metadata is unsupported by this PyTorch installation")
+            raise RuntimeError(f"{quant_format} FP8 scale metadata is unsupported by this PyTorch installation")
         s_rel = s_rel.view(float8_dtype)
     elif s_rel.dtype not in tuple(dtype for dtype in (torch.float32, float8_dtype) if dtype is not None):
-        raise ValueError(f"W4A8 weight_s_rel must use FP32 or FP8 storage, got {s_rel.dtype}")
+        raise ValueError(f"{quant_format} weight_s_rel must use FP32 or FP8 storage, got {s_rel.dtype}")
     if not isinstance(s_channel, torch.Tensor):
-        raise ValueError("W4A8 requires a weight_s_channel tensor")
+        raise ValueError(f"{quant_format} requires a weight_s_channel tensor")
 
     params = AsymW4A8Int8Layout.Params(
         scale=s_rel,
@@ -359,21 +423,86 @@ def _make_native_w4a8_tensor(
     )
     return QuantizedTensor(qdata, _W4A8_LAYOUT, params)
 
-def quantize_native_w4a8(weight, stochastic_rounding=0):
-    if not _NATIVE_W4A8_AVAILABLE:
-        raise RuntimeError("W4A8 requires ComfyUI 0.32.0 or newer with a compatible comfy-kitchen installation")
-    if weight.ndim != 2:
-        raise ValueError("W4A8 requires a two-dimensional weight")
-    if weight.shape[1] % _CONVROT_GROUP_SIZE != 0:
+def _make_native_w4a8_tensor(
+    qdata,
+    s_rel,
+    s_channel,
+    codebook,
+    correction,
+    orig_dtype,
+    orig_shape,
+    group_size=_W4A8_QUANT_GROUP_SIZE,
+    convrot_groupsize=_CONVROT_GROUP_SIZE,
+):
+    return _make_native_grouped_int8_tensor(
+        qdata,
+        s_rel,
+        s_channel,
+        codebook,
+        correction,
+        orig_dtype,
+        orig_shape,
+        W4A8_FORMAT,
+        group_size,
+        convrot_groupsize,
+    )
+
+def _resolve_grouped_int8_convrot_group_size(in_features: int) -> int:
+    if in_features % _CONVROT_GROUP_SIZE != 0:
         raise ValueError(
-            f"W4A8 in_features={weight.shape[1]} is not divisible by {_CONVROT_GROUP_SIZE}"
+            f"Grouped INT8 in_features={in_features} is not divisible by {_CONVROT_GROUP_SIZE}"
+        )
+    return _CONVROT_GROUP_SIZE
+
+def quantize_native_grouped_int8(
+    weight,
+    bits,
+    group_size,
+    convrot_groupsize=None,
+    stochastic_rounding=0,
+):
+    if not _NATIVE_W4A8_AVAILABLE:
+        raise RuntimeError("Grouped INT8 quantization requires ComfyUI 0.32.0 or newer with a compatible comfy-kitchen installation")
+    if weight.ndim != 2:
+        raise ValueError("Grouped INT8 quantization requires a two-dimensional weight")
+    bits = int(bits)
+    if bits not in (4, 6):
+        raise ValueError(f"Grouped INT8 bits must be 4 or 6, got {bits}")
+    if bits == 6 and not _NATIVE_W6A8_AVAILABLE:
+        raise RuntimeError("W6A8 requires ComfyUI with compatible comfy-kitchen support")
+    if convrot_groupsize is None:
+        convrot_groupsize = _resolve_grouped_int8_convrot_group_size(weight.shape[1])
+
+    if weight.shape[1] % _CONVROT_GROUP_SIZE != 0:
+        quant_format = W4A8_FORMAT if bits == 4 else W6A8_FORMAT
+        raise ValueError(
+            f"{quant_format} in_features={weight.shape[1]} is not divisible by {_CONVROT_GROUP_SIZE}"
         )
 
     return QuantizedTensor.from_float(
         weight,
         _W4A8_LAYOUT,
+        group_size=int(group_size),
+        convrot_groupsize=int(convrot_groupsize),
+        stochastic_rounding=stochastic_rounding,
+        bits=bits,
+        scale_search=bits == 6,
+    )
+
+def quantize_native_w4a8(weight, stochastic_rounding=0):
+    return quantize_native_grouped_int8(
+        weight,
+        bits=4,
         group_size=_W4A8_QUANT_GROUP_SIZE,
         convrot_groupsize=_CONVROT_GROUP_SIZE,
+        stochastic_rounding=stochastic_rounding,
+    )
+
+def quantize_native_w6a8(weight, stochastic_rounding=0):
+    return quantize_native_grouped_int8(
+        weight,
+        bits=6,
+        group_size=_W6A8_QUANT_GROUP_SIZE,
         stochastic_rounding=stochastic_rounding,
     )
 
@@ -2081,6 +2210,7 @@ if _COMFY_OPS_AVAILABLE:
         _otf_progress_quantized = 0
         _otf_progress_outlier = 0
         _otf_progress_last_bucket = -1
+        _mixed_profile_initialized = False
         _runtime_stats = {}
 
         @classmethod
@@ -2091,6 +2221,7 @@ if _COMFY_OPS_AVAILABLE:
             cls._otf_progress_outlier = 0
             cls._otf_progress_last_bucket = -1
             cls.int4_mixed_selected_names = set()
+            cls._mixed_profile_initialized = False
 
         @classmethod
         def _init_otf_progress(cls, state_dict, current_prefix=None, current_weight=None):
@@ -2109,7 +2240,10 @@ if _COMFY_OPS_AVAILABLE:
                     weight_entries.append((normalize_layer_name(key[:-len("weight")]), value))
 
             total_estimate = len(weight_entries)
-            if normalize_quantization_mode(cls.quantization_mode) == QUANTIZATION_MODE_INT4_MIXED:
+            if (
+                quantization_mode_uses_mixed_int8(cls.quantization_mode)
+                and not cls._mixed_profile_initialized
+            ):
                 compatible_names = [
                     layer_name
                     for layer_name, weight in weight_entries
@@ -2122,8 +2256,9 @@ if _COMFY_OPS_AVAILABLE:
                     cls.int4_sensitive_names,
                 )
                 cls.int4_mixed_selected_names = set(selected_names)
+                cls._mixed_profile_initialized = True
                 logging.info(
-                    "Quantization Toolkit on-the-fly: INT4 mixed profile "
+                    "Quantization Toolkit on-the-fly: mixed low-bit profile "
                     f"(compatible={len(compatible_names)}, "
                     f"kept_int8={len(selected_names)}, "
                     f"ratio={normalize_int4_mixed_ratio(cls.int4_mixed_ratio):.2f})"
@@ -2212,6 +2347,7 @@ if _COMFY_OPS_AVAILABLE:
                 self._convrot_groupsize = _CONVROT_GROUP_SIZE
                 self._quant_group_size = _INT4_QUANT_GROUP_SIZE
                 self._w4a8_group_size = _W4A8_QUANT_GROUP_SIZE
+                self._grouped_int8_bits = None
                 self._linear_dtype = "int4"
                 self._is_per_row = False
                 self._use_quarot = False
@@ -2254,7 +2390,8 @@ if _COMFY_OPS_AVAILABLE:
                         if isinstance(native_quant_config, dict)
                         else None
                     )
-                    if native_quant_format == _W4A8_FORMAT:
+                    if native_quant_format in _GROUPED_INT8_FORMATS:
+                        grouped_bits = _GROUPED_INT8_BITS[native_quant_format]
                         s_rel = state_dict.pop(prefix + "weight_s_rel", None)
                         s_channel = state_dict.pop(prefix + "weight_s_channel", None)
                         codebook = state_dict.pop(prefix + "weight_codebook", None)
@@ -2264,14 +2401,17 @@ if _COMFY_OPS_AVAILABLE:
                             params_config = {}
                         group_size = int(native_quant_config.get(
                             "group_size",
-                            params_config.get("group_size", _W4A8_QUANT_GROUP_SIZE),
+                            params_config.get(
+                                "group_size",
+                                _W4A8_QUANT_GROUP_SIZE if grouped_bits == 4 else _W6A8_QUANT_GROUP_SIZE,
+                            ),
                         ))
                         convrot_group_size = int(native_quant_config.get(
                             "convrot_groupsize",
                             params_config.get("convrot_groupsize", _CONVROT_GROUP_SIZE),
                         ))
                         orig_dtype = getattr(self, "weight_comfy_model_dtype", None) or torch.bfloat16
-                        q_weight = _make_native_w4a8_tensor(
+                        q_weight = _make_native_grouped_int8_tensor(
                             weight_tensor,
                             s_rel,
                             s_channel,
@@ -2279,6 +2419,7 @@ if _COMFY_OPS_AVAILABLE:
                             correction,
                             orig_dtype,
                             (self.out_features, self.in_features),
+                            native_quant_format,
                             group_size=group_size,
                             convrot_groupsize=convrot_group_size,
                         )
@@ -2287,12 +2428,13 @@ if _COMFY_OPS_AVAILABLE:
                         self.weight_packed = None
                         self.weight_int_mm = None
                         self._is_quantized = True
-                        self._quant_format = _W4A8_FORMAT
+                        self._quant_format = native_quant_format
                         self._is_per_row = False
                         self._use_quarot = False
                         self._outlier_method = OUTLIER_METHOD_NONE
                         self._convrot_groupsize = convrot_group_size
                         self._w4a8_group_size = group_size
+                        self._grouped_int8_bits = grouped_bits
                         self.quarot_hadamard = None
                         self.hadanorm_sigma = None
                         Int8TensorwiseOps._is_prequantized = True
@@ -2419,7 +2561,9 @@ if _COMFY_OPS_AVAILABLE:
 
                         quantization_mode = normalize_quantization_mode(Int8TensorwiseOps.quantization_mode)
                         int4_mode = quantization_mode_is_int4(quantization_mode)
-                        w4a8_mode = quantization_mode == QUANTIZATION_MODE_W4A8
+                        grouped_bits = quantization_mode_grouped_bits(quantization_mode)
+                        grouped_format = quantization_mode_grouped_format(quantization_mode)
+                        mixed_int8_mode = quantization_mode_uses_mixed_int8(quantization_mode)
                         keep_float = any(name in prefix for name in Int8TensorwiseOps.keep_float_names)
                         int4_sensitive = (
                             normalize_layer_name(prefix) in Int8TensorwiseOps.int4_mixed_selected_names
@@ -2453,27 +2597,48 @@ if _COMFY_OPS_AVAILABLE:
                             self.hadanorm_sigma = None
                             self._outlier_method = OUTLIER_METHOD_NONE
 
-                            int4_compatible = (
+                            grouped_compatible = (
                                 int4_mode
                                 and (
                                     _NATIVE_W4A8_AVAILABLE
-                                    if w4a8_mode
+                                    if grouped_bits is not None
                                     else _NATIVE_INT4_AVAILABLE
                                 )
                                 and w_gpu.ndim == 2
-                                and w_gpu.shape[1] % _CONVROT_GROUP_SIZE == 0
+                                and (
+                                    grouped_bits is None
+                                    or (
+                                        grouped_bits == 4
+                                        and w_gpu.shape[1] % _CONVROT_GROUP_SIZE == 0
+                                    )
+                                    or (grouped_bits == 6 and w_gpu.shape[1] % _CONVROT_GROUP_SIZE == 0)
+                                )
                             )
-                            if int4_compatible and w4a8_mode:
-                                q_weight = quantize_native_w4a8(w_gpu).to("cpu")
+                            if (
+                                grouped_compatible
+                                and grouped_format is not None
+                                and not (quantization_mode == QUANTIZATION_MODE_W4A8_MIXED and int4_sensitive)
+                            ):
+                                group_size = (
+                                    _W4A8_QUANT_GROUP_SIZE
+                                    if grouped_bits == 4
+                                    else _W6A8_QUANT_GROUP_SIZE
+                                )
+                                q_weight = quantize_native_grouped_int8(
+                                    w_gpu,
+                                    bits=grouped_bits,
+                                    group_size=group_size,
+                                ).to("cpu")
                                 self.weight = nn.Parameter(q_weight, requires_grad=False)
                                 self.weight_scale = None
                                 self.weight_packed = None
                                 self.weight_int_mm = None
                                 self._is_quantized = True
-                                self._quant_format = _W4A8_FORMAT
+                                self._quant_format = grouped_format
                                 self._is_per_row = False
                                 self._convrot_groupsize = q_weight._params.convrot_groupsize
                                 self._w4a8_group_size = q_weight._params.group_size
+                                self._grouped_int8_bits = grouped_bits
                                 quantized_now = True
                                 outlier_adjusted_now = True
                                 if track_progress:
@@ -2488,8 +2653,8 @@ if _COMFY_OPS_AVAILABLE:
                                     self.bias = None
                                 return
 
-                            if int4_compatible and not w4a8_mode and not (
-                                quantization_mode == QUANTIZATION_MODE_INT4_MIXED and int4_sensitive
+                            if grouped_compatible and grouped_format is None and not (
+                                mixed_int8_mode and int4_sensitive
                             ):
                                 linear_dtype = "int4"
                                 q_weight = quantize_native_int4(
@@ -2596,12 +2761,12 @@ if _COMFY_OPS_AVAILABLE:
                 if not getattr(self, "_is_quantized", False):
                     return output
 
-                if self._quant_format == _W4A8_FORMAT and _is_native_w4a8_tensor(self.weight):
+                if self._quant_format in _GROUPED_INT8_FORMATS and _is_native_grouped_int8_tensor(self.weight):
                     params = self.weight._params
                     output.pop(prefix + "weight_scale", None)
                     output.update(self.weight.state_dict(prefix + "weight"))
                     output[prefix + "comfy_quant"] = _encode_comfy_quant_config({
-                        "format": _W4A8_FORMAT,
+                        "format": self._quant_format,
                         "group_size": int(params.group_size),
                         "convrot_groupsize": int(params.convrot_groupsize),
                     })
@@ -2650,7 +2815,7 @@ if _COMFY_OPS_AVAILABLE:
                 return output
 
             def _replace_weight(self, new_weight, inplace_update=False):
-                if inplace_update and not _is_native_int4_tensor(new_weight) and not _is_native_w4a8_tensor(new_weight):
+                if inplace_update and not _is_native_int4_tensor(new_weight) and not _is_native_grouped_int8_tensor(new_weight):
                     self.weight.data.copy_(new_weight)
                 else:
                     self.weight = nn.Parameter(new_weight, requires_grad=False)
@@ -2659,7 +2824,7 @@ if _COMFY_OPS_AVAILABLE:
                     self.weight_packed = None
                     self.weight_int_mm = None
                     return
-                if self._quant_format == _W4A8_FORMAT:
+                if self._quant_format in _GROUPED_INT8_FORMATS:
                     self.weight_scale = None
                     self.weight_packed = None
                     self.weight_int_mm = None
@@ -2674,11 +2839,11 @@ if _COMFY_OPS_AVAILABLE:
             def convert_weight(self, _weight, inplace=False):
                 if not self._is_quantized:
                     return _weight
-                if self._quant_format in ("convrot_w4a4", _W4A8_FORMAT):
+                if self._quant_format in ("convrot_w4a4", *_GROUPED_INT8_FORMATS):
                     is_native_tensor = (
                         _is_native_int4_tensor(_weight)
                         if self._quant_format == "convrot_w4a4"
-                        else _is_native_w4a8_tensor(_weight)
+                        else _is_native_grouped_int8_tensor(_weight)
                     )
                     source_weight = _weight if is_native_tensor else self.weight
                     return source_weight.dequantize()
@@ -2699,11 +2864,11 @@ if _COMFY_OPS_AVAILABLE:
                         self._replace_weight(new_weight)
                     return
 
-                if self._quant_format in ("convrot_w4a4", _W4A8_FORMAT):
+                if self._quant_format in ("convrot_w4a4", *_GROUPED_INT8_FORMATS):
                     is_native_tensor = (
                         _is_native_int4_tensor(out_weight)
                         if self._quant_format == "convrot_w4a4"
-                        else _is_native_w4a8_tensor(out_weight)
+                        else _is_native_grouped_int8_tensor(out_weight)
                     )
                     if is_native_tensor:
                         new_weight = out_weight
@@ -2787,7 +2952,7 @@ if _COMFY_OPS_AVAILABLE:
                         device=x.device,
                     )
 
-                if self._quant_format == _W4A8_FORMAT:
+                if self._quant_format in _GROUPED_INT8_FORMATS:
                     with CastBiasWeightContext(
                         self,
                         input=None,

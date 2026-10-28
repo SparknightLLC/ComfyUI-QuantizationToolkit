@@ -1,10 +1,10 @@
-"""Temporary torch.compile compatibility boundary for comfy-kitchen W4A8.
+"""Temporary torch.compile compatibility boundary for comfy-kitchen W4A8/W6A8.
 
 Retirement path:
 1. Upstream registers ``comfy_kitchen::w4a8_int8_linear`` with a FakeTensor
    implementation.
 2. ``get_compile_support_source`` detects that operator and the Toolkit routes
-   W4A8 through the regular ``F.linear`` layout dispatch again.
+   grouped W4A8/W6A8 through the regular ``F.linear`` layout dispatch again.
 3. This module and the corresponding fallback warning can then be removed.
 """
 

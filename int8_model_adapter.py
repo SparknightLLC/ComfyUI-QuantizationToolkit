@@ -19,14 +19,21 @@ from .int8_quant import (
 	QUANTIZATION_MODE_CHOICES,
 	QUANTIZATION_MODE_INT4_MIXED,
 	QUANTIZATION_MODE_W4A8,
-	W4A8_FORMAT,
+	QUANTIZATION_MODE_W4A8_MIXED,
+	QUANTIZATION_MODE_W6A8,
+	GROUPED_INT8_FORMATS,
 	normalize_quantization_mode,
 	quantization_mode_is_int4,
+	quantization_mode_grouped_bits,
+	quantization_mode_grouped_format,
+	quantization_mode_grouped_group_size,
+	quantization_mode_uses_mixed_int8,
 	quantization_mode_outlier_method,
 	quantize_native_int4,
-	quantize_native_w4a8,
+	quantize_native_grouped_int8,
 	native_int4_available,
 	native_w4a8_available,
+	native_w6a8_available,
 	INT8_BACKEND_CHOICES,
 	DEFAULT_INT8_BACKEND,
 	INT8_BACKEND_TRITON,
@@ -53,10 +60,12 @@ from .int8_unet_loader import MODEL_TYPE_HIDREAM_O1
 from .int8_unet_loader import MODEL_TYPE_IDEOGRAM4
 from .int8_unet_loader import MODEL_TYPE_KREA2
 from .int8_unet_loader import MODEL_TYPE_MINIMAX_H3
+from .int8_unet_loader import MODEL_TYPE_MOSS
 from .int8_unet_loader import DEFAULT_QUANTIZATION_MODE
 from .int8_unet_loader import get_model_type_quantization_preset
 from .quantization_policy import DEFAULT_INT4_MIXED_RATIO
 from .quantization_policy import is_int4_compatible_linear
+from .quantization_policy import is_grouped_int8_compatible_linear
 from .quantization_policy import normalize_int4_mixed_ratio
 from .quantization_policy import select_int4_mixed_layers
 
@@ -137,6 +146,14 @@ MODEL_TYPE_FINGERPRINTS = {
 		"token_refiner",
 		"adaln_proj",
 	),
+	MODEL_TYPE_MOSS: (
+		"video_embedder",
+		"text_embedder",
+		"time_embedding",
+		"shared_block_modulation",
+		"video_head_modulation",
+		"final_linear_video",
+	),
 	"z-image": (
 		"cap_embedder",
 		"context_refiner",
@@ -198,6 +215,7 @@ MODEL_TYPE_REQUIRED_MARKERS = {
 	MODEL_TYPE_IDEOGRAM4: ("embed_image_indicator", "t_embedding"),
 	MODEL_TYPE_KREA2: ("txtfusion", "tmlp", "tproj"),
 	MODEL_TYPE_MINIMAX_H3: ("video_patch_proj", "audio_patch_proj", "token_refiner"),
+	MODEL_TYPE_MOSS: ("shared_block_modulation", "video_head_modulation"),
 	"z-image": ("cap_embedder", "context_refiner", "noise_refiner"),
 	"wan": ("patch_embedding", "time_projection"),
 	"ltx2": ("audio_adaln_single", "audio_caption_projection", "audio_patchify_proj"),
@@ -376,8 +394,8 @@ def _module_has_target_quantization(module):
 	if getattr(module, "_is_quantized", False):
 		return True
 	return (
-		getattr(module, "_quant_format", None) in ("int8_tensorwise", "convrot_w4a4", W4A8_FORMAT)
-		or getattr(module, "quant_format", None) in ("int8_tensorwise", "convrot_w4a4", W4A8_FORMAT)
+		getattr(module, "_quant_format", None) in ("int8_tensorwise", "convrot_w4a4", *GROUPED_INT8_FORMATS)
+		or getattr(module, "quant_format", None) in ("int8_tensorwise", "convrot_w4a4", *GROUPED_INT8_FORMATS)
 	)
 
 
@@ -481,7 +499,7 @@ def _build_layer_patch_bake_plan(model_patcher, layer_patch_keys, bake_deferred=
 
 
 def _configure_deferred_int8_patches(model_patcher, deferred_patch_keys, q_module):
-	if getattr(q_module, "_quant_format", "int8_tensorwise") in ("convrot_w4a4", W4A8_FORMAT):
+	if getattr(q_module, "_quant_format", "int8_tensorwise") in ("convrot_w4a4", *GROUPED_INT8_FORMATS):
 		return
 	from .int8_quant import INT8LoRAPatchAdapter, INT8MergedLoRAPatchAdapter, INT8WeightPatchAdapter
 
@@ -578,20 +596,31 @@ def _quantize_linear_module(module_name, module, source_weight, quantization_mod
 	weight_work = tensor_to_int8_compute_device(source_weight, compute_device, non_blocking=True)
 	quantization_mode = normalize_quantization_mode(quantization_mode)
 	int4_mode = quantization_mode_is_int4(quantization_mode)
-	w4a8_mode = quantization_mode == QUANTIZATION_MODE_W4A8
+	grouped_bits = quantization_mode_grouped_bits(quantization_mode)
+	grouped_format = quantization_mode_grouped_format(quantization_mode)
+	mixed_int8_mode = quantization_mode_uses_mixed_int8(quantization_mode)
 	outlier_method = quantization_mode_outlier_method(quantization_mode)
 
 	if _is_float8_dtype(weight_work.dtype):
 		weight_work = weight_work.to(torch.float16 if compute_device.type == "cuda" else torch.float32)
 
-	use_int4 = (
+	use_low_bit = (
 		int4_mode
-		and not (quantization_mode == QUANTIZATION_MODE_INT4_MIXED and int4_sensitive)
+		and not (mixed_int8_mode and int4_sensitive)
 		and weight_work.ndim == 2
-		and weight_work.shape[1] % 256 == 0
+		and (
+			is_grouped_int8_compatible_linear(weight_work, grouped_bits)
+			if grouped_bits is not None
+			else weight_work.shape[1] % 256 == 0
+		)
 	)
-	if use_int4 and w4a8_mode:
-		q_weight = quantize_native_w4a8(weight_work).to("cpu")
+	if use_low_bit and grouped_format is not None:
+		group_size = quantization_mode_grouped_group_size(quantization_mode)
+		q_weight = quantize_native_grouped_int8(
+			weight_work,
+			bits=grouped_bits,
+			group_size=group_size,
+		).to("cpu")
 		q_module = Int8TensorwiseOps.Linear(
 			module.in_features,
 			module.out_features,
@@ -603,12 +632,13 @@ def _quantize_linear_module(module_name, module, source_weight, quantization_mod
 		q_module.weight_packed = None
 		q_module.weight_int_mm = None
 		q_module._is_quantized = True
-		q_module._quant_format = W4A8_FORMAT
+		q_module._quant_format = grouped_format
 		q_module._is_per_row = False
 		q_module._use_quarot = False
 		q_module._outlier_method = OUTLIER_METHOD_NONE
 		q_module._convrot_groupsize = q_weight._params.convrot_groupsize
 		q_module._w4a8_group_size = q_weight._params.group_size
+		q_module._grouped_int8_bits = grouped_bits
 		q_module.quarot_hadamard = None
 		q_module.hadanorm_sigma = None
 		q_module.compute_dtype = getattr(module, "compute_dtype", torch.bfloat16)
@@ -623,7 +653,7 @@ def _quantize_linear_module(module_name, module, source_weight, quantization_mod
 		q_module.train(module.training)
 		return q_module, True
 
-	if use_int4:
+	if use_low_bit:
 		q_weight = quantize_native_int4(weight_work, linear_dtype="int4").to("cpu")
 		q_module = Int8TensorwiseOps.Linear(
 			module.in_features,
@@ -1070,7 +1100,7 @@ def _get_int8_patch_weight_scale(q_module):
 def _wrap_existing_int8_patch(q_module, patch_obj, seed):
 	if not _WEIGHT_ADAPTER_AVAILABLE or not isinstance(patch_obj, WeightAdapterBase):
 		return patch_obj, False
-	if getattr(q_module, "_quant_format", "int8_tensorwise") in ("convrot_w4a4", W4A8_FORMAT):
+	if getattr(q_module, "_quant_format", "int8_tensorwise") in ("convrot_w4a4", *GROUPED_INT8_FORMATS):
 		return patch_obj, False
 
 	from .int8_quant import INT8LoRAPatchAdapter, INT8MergedLoRAPatchAdapter, INT8WeightPatchAdapter
@@ -1145,7 +1175,7 @@ def _wrap_existing_int8_patch(q_module, patch_obj, seed):
 
 
 def _set_existing_int8_weight(q_module, new_weight):
-	if getattr(q_module, "_quant_format", "int8_tensorwise") in ("convrot_w4a4", W4A8_FORMAT):
+	if getattr(q_module, "_quant_format", "int8_tensorwise") in ("convrot_w4a4", *GROUPED_INT8_FORMATS):
 		q_module.set_weight(new_weight, seed=comfy.utils.string_to_seed("low_bit_existing_patch"))
 		return
 	if hasattr(q_module, "_replace_weight"):
@@ -1188,6 +1218,7 @@ def _clone_existing_int8_module(q_module):
 	cloned_module._convrot_groupsize = getattr(q_module, "_convrot_groupsize", 256)
 	cloned_module._quant_group_size = getattr(q_module, "_quant_group_size", 64)
 	cloned_module._w4a8_group_size = getattr(q_module, "_w4a8_group_size", 16)
+	cloned_module._grouped_int8_bits = getattr(q_module, "_grouped_int8_bits", None)
 	cloned_module._linear_dtype = getattr(q_module, "_linear_dtype", "int4")
 	cloned_module.quarot_hadamard = (
 		q_module.quarot_hadamard.detach().clone()
@@ -1280,7 +1311,7 @@ def _configure_existing_int8_patches(model_patcher, existing_modules, bake_loade
 				try:
 					work_weight = (
 						target_module.convert_weight(weight.detach().clone())
-						if getattr(target_module, "_quant_format", "int8_tensorwise") in ("convrot_w4a4", W4A8_FORMAT)
+						if getattr(target_module, "_quant_format", "int8_tensorwise") in ("convrot_w4a4", *GROUPED_INT8_FORMATS)
 						else weight.detach().clone()
 					)
 					baked_weight = comfy.lora.calculate_weight(
@@ -1390,10 +1421,10 @@ class INT8ModelAdapter:
 		return {
 			"required": {
 				"model": ("MODEL", {"tooltip": "The stock-loaded diffusion model to convert to the selected quantization mode."}),
-				"enable_quantization": (QUANTIZATION_CONTROL_CHOICES, {"default": QUANTIZATION_CONTROL_AS_NEEDED, "tooltip": "as_needed converts FP8 and floating-point inputs, but leaves MODEL inputs containing Toolkit-supported INT8, W4A4, or W4A8 layers unchanged. always converts remaining eligible layers; bypass returns the MODEL unchanged."}),
+				"enable_quantization": (QUANTIZATION_CONTROL_CHOICES, {"default": QUANTIZATION_CONTROL_AS_NEEDED, "tooltip": "as_needed converts FP8 and floating-point inputs, but leaves MODEL inputs containing Toolkit-supported INT8, W4A4, W4A8, or W6A8 layers unchanged. always converts remaining eligible layers; bypass returns the MODEL unchanged."}),
 				"model_type": (MODEL_TYPE_CHOICES, {"default": AUTO_MODEL_TYPE, "tooltip": "Architecture preset. Known quality-sensitive or unsafe layers remain floating-point in every mode. Auto inspects the loaded MODEL. flux2_fast_unsafe is opt-in and uses less defensive targeting. Use none only for experiments."}),
-				"quantization_mode": (QUANTIZATION_MODE_CHOICES, {"default": DEFAULT_QUANTIZATION_MODE, "tooltip": "Quantization mode. int4_mixed and int4_full use W4A4; w4a8 stores 4-bit weights while retaining ConvRot INT8 activations. All low-bit modes preserve keep-float layers."}),
-				"int4_mixed_ratio": ("FLOAT", {"default": DEFAULT_INT4_MIXED_RATIO, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Fraction of W4-compatible eligible linears kept in ConvRot INT8 when using int4_mixed. Architecture-specific patterns are prioritized; the remaining budget is distributed deterministically across the model. 0 matches int4_full layer selection and 1 keeps all compatible linears in INT8."}),
+				"quantization_mode": (QUANTIZATION_MODE_CHOICES, {"default": DEFAULT_QUANTIZATION_MODE, "tooltip": "Quantization mode. int4_mixed and int4_full use W4A4; w4a8 and w4a8_mixed use 4-bit weights with ConvRot INT8 activations; w6a8 uses 6-bit weights. All low-bit modes preserve keep-float layers."}),
+				"int4_mixed_ratio": ("FLOAT", {"default": DEFAULT_INT4_MIXED_RATIO, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Fraction of W4-compatible eligible linears kept in ConvRot INT8 for int4_mixed or w4a8_mixed. Architecture-specific sensitive layers are prioritized; the remaining budget is distributed deterministically. 0 uses the aggressive mode's full low-bit target and 1 keeps all compatible linears in INT8."}),
 				"small_batch_fallback": (SMALL_BATCH_FALLBACK_CHOICES, {"default": DEFAULT_SMALL_BATCH_FALLBACK, "tooltip": "Controls the fp16/bf16 fallback for very small activation batches on Toolkit W8A8 layers. It does not alter native W4A4 or W4A8 execution. only_small_layers is the default; always can help tiny row counts but often slows larger layers; never forces the INT8 backend."}),
 				"runtime_backend": (INT8_BACKEND_CHOICES, {"default": DEFAULT_INT8_BACKEND, "tooltip": "Backend for non-ConvRot INT8 linear layers. int8_convrot always uses Comfy-Kitchen's native fused runtime. torch_int_mm is the default for other INT8 modes; triton may be faster on some shapes; triton_legacy_unsafe is diagnostic only and may be incorrect on tail shapes."}),
 				"prepack_weights": ("BOOLEAN", {"default": False, "tooltip": "Experimental runtime weight prepacking. This currently applies only to Triton INT8 layers, where it keeps an extra transposed weight buffer so output columns are read contiguously. It may improve speed but adds roughly one extra INT8 copy of each affected weight."}),
@@ -1405,7 +1436,7 @@ class INT8ModelAdapter:
 	RETURN_TYPES = ("MODEL",)
 	FUNCTION = "apply_quantization"
 	CATEGORY = "loaders"
-	DESCRIPTION = "Convert a stock-loaded diffusion MODEL to Toolkit W8A8, native ConvRot W4A4, or experimental native W4A8. Put this after stock Load LoRA to bake loaded LoRAs before quantization."
+	DESCRIPTION = "Convert a stock-loaded diffusion MODEL to Toolkit W8A8, native ConvRot W4A4, W4A8, or W6A8. Put this after stock Load LoRA to bake loaded LoRAs before quantization."
 
 	def apply_quantization(
 		self,
@@ -1439,12 +1470,21 @@ class INT8ModelAdapter:
 		int4_mixed_ratio = normalize_int4_mixed_ratio(int4_mixed_ratio)
 		effective_int4_mixed_ratio = (
 			int4_mixed_ratio
-			if quantization_mode == QUANTIZATION_MODE_INT4_MIXED
+			if quantization_mode_uses_mixed_int8(quantization_mode)
 			else 0.0
 		)
-		if quantization_mode == QUANTIZATION_MODE_W4A8 and not native_w4a8_available():
+		if (
+			quantization_mode in (QUANTIZATION_MODE_W4A8, QUANTIZATION_MODE_W4A8_MIXED)
+			and not native_w4a8_available()
+		):
 			raise RuntimeError("W4A8 quantization requires ComfyUI 0.32.0 or newer with a compatible comfy-kitchen installation")
-		if quantization_mode != QUANTIZATION_MODE_W4A8 and quantization_mode_is_int4(quantization_mode) and not native_int4_available():
+		if quantization_mode == QUANTIZATION_MODE_W6A8 and not native_w6a8_available():
+			raise RuntimeError("W6A8 quantization requires ComfyUI with compatible comfy-kitchen grouped INT8 support")
+		if (
+			quantization_mode_grouped_bits(quantization_mode) is None
+			and quantization_mode_is_int4(quantization_mode)
+			and not native_int4_available()
+		):
 			raise RuntimeError("INT4 quantization requires a recent ComfyUI and comfy-kitchen with ConvRot W4A4 support")
 		if output_cache is None:
 			output_cache = _prepare_model_cache(source_model_patcher.model)
@@ -1581,7 +1621,7 @@ class INT8ModelAdapter:
 			if is_int4_compatible_linear(getattr(module, "weight", None))
 		]
 		int4_mixed_selected_names = set()
-		if quantization_mode == QUANTIZATION_MODE_INT4_MIXED:
+		if quantization_mode_uses_mixed_int8(quantization_mode):
 			int4_mixed_selected_names = set(select_int4_mixed_layers(
 				int4_compatible_names,
 				effective_int4_mixed_ratio,
@@ -1589,7 +1629,7 @@ class INT8ModelAdapter:
 			))
 			if log_progress:
 				logging.info(
-					"Quantization Model Adapter: INT4 mixed profile "
+					"Quantization Model Adapter: mixed low-bit profile "
 					f"(compatible={len(int4_compatible_names)}, "
 					f"kept_int8={len(int4_mixed_selected_names)}, "
 					f"ratio={effective_int4_mixed_ratio:.2f}, "

@@ -15,7 +15,13 @@ except (ImportError, AttributeError):
 	QuantizedTensor = None
 
 
-_SUPPORTED_QUANTIZATION_FORMATS = {"int8_tensorwise", "convrot_w4a4", "asym_w4a8_int8"}
+_SUPPORTED_QUANTIZATION_FORMATS = {
+	"int8_tensorwise",
+	"convrot_w4a4",
+	"asym_w4a8_int8",
+	"w6a8_int8",
+}
+_GROUPED_INT8_FORMATS = {"asym_w4a8_int8", "w6a8_int8"}
 
 
 def _install_lazy_casting_param_workaround():
@@ -62,7 +68,7 @@ def _install_lazy_casting_param_workaround():
 def _is_int8_quantized_module(module):
 	if not getattr(module, "_is_quantized", False):
 		return False
-	if getattr(module, "_quant_format", None) in ("convrot_w4a4", "asym_w4a8_int8"):
+	if getattr(module, "_quant_format", None) in ("convrot_w4a4", *_GROUPED_INT8_FORMATS):
 		return True
 
 	weight = getattr(module, "weight", None)
@@ -102,7 +108,7 @@ def _model_contains_supported_quantization(model_patcher):
 def _validate_quantized_model(model_patcher):
 	if not _model_contains_supported_quantization(model_patcher):
 		raise ValueError(
-			"Save Quantized Model requires a MODEL containing Toolkit INT8, native ConvRot W4A4, or W4A8 weights. "
+			"Save Quantized Model requires a MODEL containing Toolkit INT8, native ConvRot W4A4, W4A8, or W6A8 weights. "
 			"Place Enable Quantization on MODEL before Load LoRA (Quantized) and this save node."
 		)
 
@@ -120,7 +126,7 @@ def _validate_quantized_model(model_patcher):
 
 
 def _module_has_non_float_weight(module):
-	if getattr(module, "_quant_format", None) in ("convrot_w4a4", "asym_w4a8_int8"):
+	if getattr(module, "_quant_format", None) in ("convrot_w4a4", *_GROUPED_INT8_FORMATS):
 		return True
 	weight = getattr(module, "weight", None)
 	if not isinstance(weight, torch.Tensor):
@@ -287,10 +293,11 @@ def _summarize_saved_quantized_checkpoint(path):
 		int8_weights = 0
 		total_weights = 0
 		weight_scales = 0
-		w4a8_scales = 0
+		grouped_int8_scales = 0
 		comfy_quant_layers = 0
 		int4_layers = 0
 		w4a8_layers = 0
+		w6a8_layers = 0
 		int8_layers = 0
 		with safe_open(path, framework="pt", device="cpu") as handle:
 			metadata = handle.metadata()
@@ -306,7 +313,7 @@ def _summarize_saved_quantized_checkpoint(path):
 				elif key.endswith(".weight_scale"):
 					weight_scales += 1
 				elif key.endswith(".weight_s_rel"):
-					w4a8_scales += 1
+					grouped_int8_scales += 1
 				elif key.endswith(".comfy_quant"):
 					comfy_quant_layers += 1
 					try:
@@ -315,6 +322,8 @@ def _summarize_saved_quantized_checkpoint(path):
 							int4_layers += 1
 						elif quant_config.get("format") == "asym_w4a8_int8":
 							w4a8_layers += 1
+						elif quant_config.get("format") == "w6a8_int8":
+							w6a8_layers += 1
 						elif quant_config.get("format") == "int8_tensorwise":
 							int8_layers += 1
 					except Exception:
@@ -322,12 +331,12 @@ def _summarize_saved_quantized_checkpoint(path):
 
 		logging.info(
 			"Quantization Toolkit save: checkpoint summary "
-			f"(int8_weights={int8_weights}, weight_scales={weight_scales}, w4a8_scales={w4a8_scales}, "
-			f"int4_layers={int4_layers}, w4a8_layers={w4a8_layers}, int8_layers={int8_layers}, "
+			f"(int8_weights={int8_weights}, weight_scales={weight_scales}, grouped_int8_scales={grouped_int8_scales}, "
+			f"int4_layers={int4_layers}, w4a8_layers={w4a8_layers}, w6a8_layers={w6a8_layers}, int8_layers={int8_layers}, "
 			f"comfy_quant_layers={comfy_quant_layers}, total_weights={total_weights}, "
 			f"dtypes={dtype_counts})."
 		)
-		if int8_weights == 0 or (weight_scales == 0 and w4a8_scales == 0):
+		if int8_weights == 0 or (weight_scales == 0 and grouped_int8_scales == 0):
 			logging.warning("Quantization Toolkit Save: saved checkpoint does not appear to contain packed INT4 or INT8 weights.")
 		elif comfy_quant_layers == 0 and not has_legacy_quant_metadata:
 			logging.warning(
@@ -363,7 +372,7 @@ class INT8ModelSave:
 	FUNCTION = "save"
 	OUTPUT_NODE = True
 	CATEGORY = "loaders"
-	DESCRIPTION = "Save MODEL outputs that include Toolkit INT8, native ConvRot W4A4, or W4A8 layers with a DynamicVRAM-safe save path."
+	DESCRIPTION = "Save MODEL outputs that include Toolkit INT8, native ConvRot W4A4, W4A8, or W6A8 layers with a DynamicVRAM-safe save path."
 
 	def save(self, model, filename_prefix, prompt=None, extra_pnginfo=None):
 		_validate_quantized_model(model)

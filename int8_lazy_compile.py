@@ -348,22 +348,25 @@ def _has_native_int4_modules(model_patcher):
 	return any(getattr(module, "_quant_format", None) == "convrot_w4a4" for module in diffusion_model.modules())
 
 
-def _has_w4a8_modules(model_patcher):
-	def is_w4a8(module):
+def _has_grouped_int8_modules(model_patcher):
+	def is_grouped_int8(module):
 		return (
-			getattr(module, "_quant_format", None) == "asym_w4a8_int8"
-			or getattr(module, "quant_format", None) == "asym_w4a8_int8"
+			getattr(module, "_quant_format", None) in ("asym_w4a8_int8", "w6a8_int8")
+			or getattr(module, "quant_format", None) in ("asym_w4a8_int8", "w6a8_int8")
 		)
 
 	for object_patch_map_name in ("object_patches", "object_patches_backup"):
 		object_patch_map = getattr(model_patcher, object_patch_map_name, None)
-		if isinstance(object_patch_map, dict) and any(is_w4a8(module) for module in object_patch_map.values()):
+		if isinstance(object_patch_map, dict) and any(is_grouped_int8(module) for module in object_patch_map.values()):
 			return True
 
 	diffusion_model = getattr(getattr(model_patcher, "model", None), "diffusion_model", None)
 	if diffusion_model is None:
 		return False
-	return any(is_w4a8(module) for module in diffusion_model.modules())
+	return any(is_grouped_int8(module) for module in diffusion_model.modules())
+
+def _has_w4a8_modules(model_patcher):
+	return _has_grouped_int8_modules(model_patcher)
 
 
 def _can_use_host_prefix_cache(model):
@@ -417,12 +420,12 @@ def _build_native_int4_compile_info():
 
 def _build_w4a8_compile_warning():
 	return (
-		"Quantized Lazy Torch Compile: W4A8 detected; torch.compile was not applied.\n"
+		"Quantized Lazy Torch Compile: W4A8/W6A8 detected; torch.compile was not applied.\n"
 		f"  Installed comfy-kitchen version: {_get_comfy_kitchen_version()}\n"
 		"  Upstream limitation: AsymW4A8Int8Layout does not expose a compiler-safe "
 		"w4a8_int8_linear torch.library custom operator with a FakeTensor implementation.\n"
 		f"  Toolkit compatibility shim: unavailable ({w4a8_compile_compat.get_compile_support_error()})\n"
-		"  Result: this MODEL is returned uncompiled and will use the native eager W4A8 runtime."
+		"  Result: this MODEL is returned uncompiled and will use the native eager grouped INT8 runtime."
 	)
 
 
@@ -433,7 +436,7 @@ def _build_w4a8_compile_info():
 	else:
 		support_label = "temporary Toolkit custom-op shim"
 	return (
-		"Quantized Lazy Torch Compile: W4A8 compile support enabled "
+		"Quantized Lazy Torch Compile: W4A8/W6A8 compile support enabled "
 		f"via {support_label} (comfy-kitchen {_get_comfy_kitchen_version()})."
 	)
 

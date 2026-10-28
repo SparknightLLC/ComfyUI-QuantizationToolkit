@@ -52,16 +52,18 @@ class LazyCompileTests(unittest.TestCase):
 
 		self.assertTrue(lazy_compile._has_native_int4_modules(model_patcher))
 
-	def test_w4a8_object_patch_is_detected(self):
-		w4a8_module = torch.nn.Linear(4, 4)
-		w4a8_module._quant_format = "asym_w4a8_int8"
-		model_patcher = SimpleNamespace(
-			object_patches={"diffusion_model.block.linear": w4a8_module},
-			object_patches_backup={},
-			model=SimpleNamespace(diffusion_model=torch.nn.Module()),
-		)
+	def test_grouped_int8_object_patches_are_detected(self):
+		for quant_format in ("asym_w4a8_int8", "w6a8_int8"):
+			with self.subTest(quant_format=quant_format):
+				grouped_module = torch.nn.Linear(4, 4)
+				grouped_module._quant_format = quant_format
+				model_patcher = SimpleNamespace(
+					object_patches={"diffusion_model.block.linear": grouped_module},
+					object_patches_backup={},
+					model=SimpleNamespace(diffusion_model=torch.nn.Module()),
+				)
 
-		self.assertTrue(lazy_compile._has_w4a8_modules(model_patcher))
+				self.assertTrue(lazy_compile._has_grouped_int8_modules(model_patcher))
 
 	def test_w4a8_warning_explains_upstream_compile_limitation(self):
 		with mock.patch.object(lazy_compile.importlib.metadata, "version", return_value="0.2.28"):
@@ -74,6 +76,7 @@ class LazyCompileTests(unittest.TestCase):
 
 		self.assertIn("Installed comfy-kitchen version: 0.2.28", message)
 		self.assertIn("AsymW4A8Int8Layout", message)
+		self.assertIn("W4A8/W6A8", message)
 		self.assertIn("torch.library custom operator", message)
 		self.assertIn("FakeTensor implementation", message)
 		self.assertIn("test registration failure", message)

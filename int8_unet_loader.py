@@ -13,16 +13,23 @@ from .int8_quant import (
     QUANTIZATION_MODE_INT8,
     QUANTIZATION_MODE_INT4_MIXED,
     QUANTIZATION_MODE_W4A8,
+    QUANTIZATION_MODE_W4A8_MIXED,
+    QUANTIZATION_MODE_W6A8,
     normalize_quantization_mode,
     quantization_mode_outlier_method,
     quantization_mode_is_int4,
+    quantization_mode_grouped_bits,
+    quantization_mode_uses_mixed_int8,
     native_int4_available,
     native_w4a8_available,
+    native_w6a8_available,
     SMALL_BATCH_FALLBACK_CHOICES,
     DEFAULT_SMALL_BATCH_FALLBACK,
 )
 from .quantization_policy import DEFAULT_INT4_MIXED_RATIO
+from .quantization_policy import is_int4_compatible_linear
 from .quantization_policy import normalize_int4_mixed_ratio
+from .quantization_policy import select_int4_mixed_layers
 
 
 MODEL_TYPE_FLUX2 = "flux2"
@@ -32,6 +39,7 @@ MODEL_TYPE_HIDREAM_O1 = "hidream o1"
 MODEL_TYPE_IDEOGRAM4 = "ideogram4"
 MODEL_TYPE_KREA2 = "krea2"
 MODEL_TYPE_MINIMAX_H3 = "minimax_h3"
+MODEL_TYPE_MOSS = "moss"
 MODEL_TYPE_CHOICES = [
     "anima",
     MODEL_TYPE_BOOGU,
@@ -43,6 +51,7 @@ MODEL_TYPE_CHOICES = [
     MODEL_TYPE_IDEOGRAM4,
     MODEL_TYPE_KREA2,
     MODEL_TYPE_MINIMAX_H3,
+    MODEL_TYPE_MOSS,
     "ltx2",
     "qwen",
     "sdxl",
@@ -109,6 +118,11 @@ def _get_model_type_keep_float(model_type):
             "video_patch_proj", "audio_patch_proj", "condition_proj", "time_embedder",
             "token_refiner", "adaln_proj", "final_layer",
         ]
+    if model_type == MODEL_TYPE_MOSS:
+        return [
+            "video_embedder", "text_embedder", "time_embedding", "shared_block_modulation",
+            "video_head_modulation", "final_linear_video", "final_norm_video",
+        ]
     if model_type == "sdxl":
         return [
             "time_embed", "label_emb", "emb_layers", "proj_in", "proj_out",
@@ -142,6 +156,10 @@ def _get_model_type_int4_sensitive(model_type):
         return [
             "attn.out_proj", "mlp.fc2",
         ]
+    if model_type == MODEL_TYPE_MOSS:
+        return [
+            "proj.o", "proj.ffn_down",
+        ]
     return []
 
 
@@ -161,6 +179,36 @@ def _read_safetensors_metadata(path):
             metadata = handle.metadata()
             return dict(metadata) if isinstance(metadata, dict) else None
     except Exception:
+        return None
+
+
+def _select_int4_mixed_layers_from_safetensors(path, keep_float_names, priority_patterns, ratio):
+    if not isinstance(path, str) or not path.lower().endswith(".safetensors"):
+        return None
+    try:
+        from safetensors import safe_open
+        with safe_open(path, framework="pt", device="cpu") as handle:
+            compatible_names = []
+            for key in handle.keys():
+                if not key.endswith(".weight"):
+                    continue
+                layer_name = key[:-len(".weight")]
+                for prefix in ("model.diffusion_model.", "diffusion_model."):
+                    if layer_name.startswith(prefix):
+                        layer_name = layer_name[len(prefix):]
+                        break
+                if any(pattern in layer_name for pattern in keep_float_names):
+                    continue
+                weight_slice = handle.get_slice(key)
+                if is_int4_compatible_linear(weight_slice):
+                    compatible_names.append(layer_name)
+        return set(select_int4_mixed_layers(
+            compatible_names,
+            ratio,
+            priority_patterns,
+        ))
+    except Exception as e:
+        logging.warning(f"Quantization Toolkit loader: failed to preselect the mixed low-bit profile ({e}).")
         return None
 
 
@@ -200,8 +248,8 @@ class UNetLoaderINTW8A8:
                 "weight_dtype": (["default", "fp8_e4m3fn", "fp16", "bf16"], {"tooltip": "Requested source weight dtype passed to ComfyUI during model construction. INT8 checkpoints still load as INT8 when weight_scale tensors are present."}),
                 "model_type": (MODEL_TYPE_CHOICES, {"tooltip": "Architecture preset. Known quality-sensitive or unsafe layers remain floating-point in every mode. flux2_fast_unsafe is opt-in and less conservative."}),
                 "on_the_fly_quantization": ("BOOLEAN", {"default": False, "tooltip": "Quantize eligible float or FP8 weights using the selected mode during loading. Leave off for checkpoints that already contain native quantization metadata."}),
-                "quantization_mode": (QUANTIZATION_MODE_CHOICES, {"default": DEFAULT_QUANTIZATION_MODE, "tooltip": "Quantization mode. int4_mixed and int4_full use W4A4; w4a8 stores 4-bit weights while retaining ConvRot INT8 activations. All low-bit modes preserve keep-float layers."}),
-                "int4_mixed_ratio": ("FLOAT", {"default": DEFAULT_INT4_MIXED_RATIO, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Fraction of W4-compatible eligible linears kept in ConvRot INT8 when using int4_mixed. Architecture-specific patterns are prioritized; the remaining budget is distributed deterministically across the model. 0 matches int4_full layer selection and 1 keeps all compatible linears in INT8."}),
+                "quantization_mode": (QUANTIZATION_MODE_CHOICES, {"default": DEFAULT_QUANTIZATION_MODE, "tooltip": "Quantization mode. int4_mixed and int4_full use W4A4; w4a8 and w4a8_mixed use 4-bit weights with ConvRot INT8 activations; w6a8 uses 6-bit weights. All low-bit modes preserve keep-float layers."}),
+                "int4_mixed_ratio": ("FLOAT", {"default": DEFAULT_INT4_MIXED_RATIO, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Fraction of W4-compatible eligible linears kept in ConvRot INT8 for int4_mixed or w4a8_mixed. Architecture-specific sensitive layers are prioritized; the remaining budget is distributed deterministically. 0 uses the aggressive mode's full low-bit target and 1 keeps all compatible linears in INT8."}),
                 "small_batch_fallback": (SMALL_BATCH_FALLBACK_CHOICES, {"default": DEFAULT_SMALL_BATCH_FALLBACK, "tooltip": "Controls the fp16/bf16 fallback for very small activation batches on Toolkit W8A8 layers. It does not alter native W4A4 or W4A8 execution. only_small_layers is the default; always can help tiny row counts but often slows larger layers; never forces the INT8 backend."}),
                 "runtime_backend": (INT8_BACKEND_CHOICES, {"default": DEFAULT_INT8_BACKEND, "tooltip": "Backend for non-ConvRot INT8 linear layers. int8_convrot always uses Comfy-Kitchen's native fused runtime. torch_int_mm is the default for other INT8 modes; triton may be faster on some shapes; triton_legacy_unsafe is diagnostic only and may be incorrect on tail shapes."}),
                 "prepack_weights": ("BOOLEAN", {"default": False, "tooltip": "Experimental runtime weight prepacking. This currently applies only to Triton INT8 layers, where it keeps an extra transposed weight buffer so output columns are read contiguously. It may improve speed but adds roughly one extra INT8 copy of each affected weight."}),
@@ -211,7 +259,7 @@ class UNetLoaderINTW8A8:
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "load_unet"
     CATEGORY = "loaders"
-    DESCRIPTION = "Load native W8A8, W4A4, or experimental W4A8 checkpoints, or quantize float and FP8 diffusion models on the fly."
+    DESCRIPTION = "Load native W8A8, W4A4, W4A8, or W6A8 checkpoints, or quantize float and FP8 diffusion models on the fly."
 
     def load_unet(
         self,
@@ -247,9 +295,20 @@ class UNetLoaderINTW8A8:
         Int8TensorwiseOps.int4_sensitive_names = []
         Int8TensorwiseOps.dynamic_quantize = on_the_fly_quantization
         quantization_mode = normalize_quantization_mode(quantization_mode)
-        if on_the_fly_quantization and quantization_mode == QUANTIZATION_MODE_W4A8 and not native_w4a8_available():
+        if (
+            on_the_fly_quantization
+            and quantization_mode in (QUANTIZATION_MODE_W4A8, QUANTIZATION_MODE_W4A8_MIXED)
+            and not native_w4a8_available()
+        ):
             raise RuntimeError("W4A8 quantization requires ComfyUI 0.32.0 or newer with a compatible comfy-kitchen installation")
-        if on_the_fly_quantization and quantization_mode != QUANTIZATION_MODE_W4A8 and quantization_mode_is_int4(quantization_mode) and not native_int4_available():
+        if on_the_fly_quantization and quantization_mode == QUANTIZATION_MODE_W6A8 and not native_w6a8_available():
+            raise RuntimeError("W6A8 quantization requires ComfyUI with compatible comfy-kitchen grouped INT8 support")
+        if (
+            on_the_fly_quantization
+            and quantization_mode_grouped_bits(quantization_mode) is None
+            and quantization_mode_is_int4(quantization_mode)
+            and not native_int4_available()
+        ):
             raise RuntimeError("INT4 quantization requires a recent ComfyUI and comfy-kitchen with ConvRot W4A4 support")
         Int8TensorwiseOps.quantization_mode = quantization_mode if on_the_fly_quantization else QUANTIZATION_MODE_INT8
         Int8TensorwiseOps.int4_mixed_ratio = normalize_int4_mixed_ratio(int4_mixed_ratio)
@@ -266,6 +325,22 @@ class UNetLoaderINTW8A8:
         quantization_preset = get_model_type_quantization_preset(model_type)
         Int8TensorwiseOps.keep_float_names = list(quantization_preset["keep_float"])
         Int8TensorwiseOps.int4_sensitive_names = list(quantization_preset["int4_sensitive"])
+        if on_the_fly_quantization and quantization_mode_uses_mixed_int8(quantization_mode):
+            selected_names = _select_int4_mixed_layers_from_safetensors(
+                unet_path,
+                Int8TensorwiseOps.keep_float_names,
+                Int8TensorwiseOps.int4_sensitive_names,
+                Int8TensorwiseOps.int4_mixed_ratio,
+            )
+            if selected_names is not None:
+                Int8TensorwiseOps.int4_mixed_selected_names = selected_names
+                Int8TensorwiseOps._mixed_profile_initialized = True
+                logging.info(
+                    "Quantization Toolkit loader: mixed low-bit profile "
+                    f"(kept_int8={len(selected_names)}, "
+                    f"ratio={Int8TensorwiseOps.int4_mixed_ratio:.2f}, "
+                    f"preset_patterns={len(Int8TensorwiseOps.int4_sensitive_names)})"
+                )
         if on_the_fly_quantization and model_type == MODEL_TYPE_FLUX2_FAST_UNSAFE:
             logging.info("Quantization Toolkit loader: flux2_fast_unsafe selected; using the less conservative Flux2 keep-float preset.")
 

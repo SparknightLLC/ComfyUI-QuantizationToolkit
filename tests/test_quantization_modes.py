@@ -1,5 +1,6 @@
 import importlib
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -356,13 +357,25 @@ class QuantizationModeTests(unittest.TestCase):
 			self.assertNotIn(mode, quant.QUANTIZATION_MODE_CHOICES)
 			self.assertEqual(quant.normalize_quantization_mode(mode), "int8")
 
-	def test_w4a8_is_exposed_as_a_distinct_low_bit_mode(self):
-		self.assertIn(quant.QUANTIZATION_MODE_W4A8, quant.QUANTIZATION_MODE_CHOICES)
-		self.assertTrue(quant.quantization_mode_is_int4(quant.QUANTIZATION_MODE_W4A8))
-		self.assertEqual(
-			quant.quantization_mode_outlier_method(quant.QUANTIZATION_MODE_W4A8),
-			quant.OUTLIER_METHOD_NONE,
-		)
+	def test_grouped_int8_modes_are_exposed_as_distinct_low_bit_modes(self):
+		for quantization_mode in (
+			quant.QUANTIZATION_MODE_W4A8,
+			quant.QUANTIZATION_MODE_W4A8_MIXED,
+			quant.QUANTIZATION_MODE_W6A8,
+		):
+			with self.subTest(quantization_mode=quantization_mode):
+				self.assertIn(quantization_mode, quant.QUANTIZATION_MODE_CHOICES)
+				self.assertTrue(quant.quantization_mode_is_int4(quantization_mode))
+				self.assertEqual(
+					quant.quantization_mode_outlier_method(quantization_mode),
+					quant.OUTLIER_METHOD_NONE,
+				)
+
+		self.assertEqual(quant.quantization_mode_grouped_bits(quant.QUANTIZATION_MODE_W4A8), 4)
+		self.assertEqual(quant.quantization_mode_grouped_bits(quant.QUANTIZATION_MODE_W4A8_MIXED), 4)
+		self.assertEqual(quant.quantization_mode_grouped_bits(quant.QUANTIZATION_MODE_W6A8), 6)
+		self.assertEqual(quant.quantization_mode_grouped_format(quant.QUANTIZATION_MODE_W6A8), quant.W6A8_FORMAT)
+		self.assertTrue(quant.quantization_mode_uses_mixed_int8(quant.QUANTIZATION_MODE_W4A8_MIXED))
 
 	def test_model_adapter_rejects_w4a8_without_native_layout(self):
 		with mock.patch.object(model_adapter, "native_w4a8_available", return_value=False):
@@ -405,6 +418,40 @@ class QuantizationModeTests(unittest.TestCase):
 			return_weight=True,
 		)
 		self.assertEqual(requantized._layout_cls, "AsymW4A8Int8Layout")
+
+	@unittest.skipUnless(quant._NATIVE_W6A8_AVAILABLE, "Native ComfyUI W6A8 support is unavailable")
+	def test_native_w6a8_state_dict_round_trip_and_requantization(self):
+		q_weight = quant.quantize_native_w6a8(torch.randn(8, 256, dtype=torch.float32))
+		module = quant.Int8TensorwiseOps.Linear(256, 8, bias=False, device="cpu", dtype=torch.float32)
+		module.weight = torch.nn.Parameter(q_weight, requires_grad=False)
+		module.weight_scale = None
+		module._is_quantized = True
+		module._quant_format = quant.W6A8_FORMAT
+		module._convrot_groupsize = q_weight._params.convrot_groupsize
+		module._w4a8_group_size = q_weight._params.group_size
+		module._grouped_int8_bits = 6
+
+		state_dict = module.state_dict()
+		self.assertEqual(tuple(state_dict["weight"].shape), (8, 192))
+		self.assertEqual(state_dict["weight_s_rel"].shape, (8, 8))
+		self.assertNotIn("weight_codebook", state_dict)
+		quant_config = quant._decode_comfy_quant_config(state_dict["comfy_quant"])
+		self.assertEqual(quant_config["format"], quant.W6A8_FORMAT)
+		self.assertEqual(quant_config["group_size"], 32)
+
+		loaded = quant.Int8TensorwiseOps.Linear(256, 8, bias=False, device="cpu", dtype=torch.float32)
+		loaded.load_state_dict(state_dict, strict=False)
+		self.assertEqual(loaded._quant_format, quant.W6A8_FORMAT)
+		self.assertEqual(loaded._grouped_int8_bits, 6)
+		self.assertEqual(loaded.weight._layout_cls, "AsymW4A8Int8Layout")
+
+		requantized = loaded.set_weight(
+			loaded.convert_weight(loaded.weight) + 0.01,
+			seed=17,
+			return_weight=True,
+		)
+		self.assertEqual(requantized._layout_cls, "AsymW4A8Int8Layout")
+		self.assertEqual(tuple(requantized._qdata.shape), (8, 192))
 
 	@unittest.skipUnless(quant._NATIVE_INT4_AVAILABLE, "Native ComfyUI INT4 layout is unavailable")
 	def test_native_int4_state_dict_round_trip(self):
@@ -517,6 +564,91 @@ class QuantizationModeTests(unittest.TestCase):
 		self.assertEqual(bulk._quant_format, "convrot_w4a4")
 		self.assertEqual(sensitive._quant_format, "int8_tensorwise")
 
+	@unittest.skipUnless(quant._NATIVE_W4A8_AVAILABLE, "Native ComfyUI W4A8 layout is unavailable")
+	def test_w4a8_mixed_keeps_sensitive_layer_in_int8(self):
+		quant.Int8TensorwiseOps.dynamic_quantize = True
+		quant.Int8TensorwiseOps._is_prequantized = False
+		quant.Int8TensorwiseOps.quantization_mode = quant.QUANTIZATION_MODE_W4A8_MIXED
+		quant.Int8TensorwiseOps.keep_float_names = []
+		quant.Int8TensorwiseOps.int4_sensitive_names = ["sensitive"]
+		quant.Int8TensorwiseOps.int4_mixed_ratio = 0.5
+		state_dict = {
+			"bulk.weight": torch.randn(16, 256),
+			"sensitive.weight": torch.randn(16, 256),
+		}
+		quant.Int8TensorwiseOps._init_otf_progress(state_dict)
+
+		bulk = quant.Int8TensorwiseOps.Linear(256, 16, bias=False, device="cpu", dtype=torch.float32)
+		bulk._load_from_state_dict(
+			{"bulk.weight": state_dict["bulk.weight"]},
+			"bulk.",
+			{},
+			False,
+			[],
+			[],
+			[],
+		)
+
+		sensitive = quant.Int8TensorwiseOps.Linear(256, 16, bias=False, device="cpu", dtype=torch.float32)
+		sensitive._load_from_state_dict(
+			{"sensitive.weight": state_dict["sensitive.weight"]},
+			"sensitive.",
+			{},
+			False,
+			[],
+			[],
+			[],
+		)
+
+		self.assertEqual(bulk._quant_format, quant.W4A8_FORMAT)
+		self.assertEqual(sensitive._quant_format, "int8_tensorwise")
+
+	@unittest.skipUnless(quant._NATIVE_W6A8_AVAILABLE, "Native ComfyUI W6A8 support is unavailable")
+	def test_w6a8_on_the_fly_uses_native_layout(self):
+		quant.Int8TensorwiseOps.dynamic_quantize = True
+		quant.Int8TensorwiseOps._is_prequantized = False
+		quant.Int8TensorwiseOps.quantization_mode = quant.QUANTIZATION_MODE_W6A8
+		quant.Int8TensorwiseOps.keep_float_names = []
+
+		module = quant.Int8TensorwiseOps.Linear(256, 8, bias=False, device="cpu", dtype=torch.float32)
+		module._load_from_state_dict(
+			{"bulk.weight": torch.randn(8, 256)},
+			"bulk.",
+			{},
+			False,
+			[],
+			[],
+			[],
+		)
+
+		self.assertEqual(module._quant_format, quant.W6A8_FORMAT)
+		self.assertEqual(module._grouped_int8_bits, 6)
+		self.assertEqual(module.weight._layout_cls, "AsymW4A8Int8Layout")
+
+	def test_model_adapter_quantizes_w6a8_and_w4a8_mixed(self):
+		def quantize(mode, int4_sensitive=False):
+			module = nn.Linear(256, 16, bias=False, device="cpu", dtype=torch.float32)
+			with mock.patch.object(model_adapter, "_get_int8_compute_device", return_value=torch.device("cpu")):
+				return model_adapter._quantize_linear_module(
+					"blocks.0.proj",
+					module,
+					module.weight.detach(),
+					mode,
+					int4_sensitive=int4_sensitive,
+				)[0]
+
+		if quant._NATIVE_W6A8_AVAILABLE:
+			w6_module = quantize(quant.QUANTIZATION_MODE_W6A8)
+			self.assertEqual(w6_module._quant_format, quant.W6A8_FORMAT)
+			self.assertEqual(w6_module._grouped_int8_bits, 6)
+			self.assertEqual(w6_module._w4a8_group_size, 32)
+
+		mixed_w4a8_module = quantize(quant.QUANTIZATION_MODE_W4A8_MIXED)
+		self.assertEqual(mixed_w4a8_module._quant_format, quant.W4A8_FORMAT)
+
+		mixed_int8_module = quantize(quant.QUANTIZATION_MODE_W4A8_MIXED, int4_sensitive=True)
+		self.assertEqual(mixed_int8_module._quant_format, "int8_tensorwise")
+
 	@unittest.skipUnless(quant._NATIVE_INT4_AVAILABLE, "Native ComfyUI INT4 layout is unavailable")
 	def test_int4_full_promotes_sensitive_layer_to_int4(self):
 		quant.Int8TensorwiseOps.dynamic_quantize = True
@@ -571,6 +703,7 @@ class QuantizationModeTests(unittest.TestCase):
 		krea_preset = loader.get_model_type_quantization_preset(loader.MODEL_TYPE_KREA2)
 		anima_preset = loader.get_model_type_quantization_preset("anima")
 		minimax_preset = loader.get_model_type_quantization_preset(loader.MODEL_TYPE_MINIMAX_H3)
+		moss_preset = loader.get_model_type_quantization_preset(loader.MODEL_TYPE_MOSS)
 
 		self.assertIn("first", krea_preset["keep_float"])
 		self.assertEqual(krea_preset["int4_sensitive"], ("attn.wo", "mlp.down"))
@@ -587,6 +720,14 @@ class QuantizationModeTests(unittest.TestCase):
 			),
 		)
 		self.assertEqual(minimax_preset["int4_sensitive"], ("attn.out_proj", "mlp.fc2"))
+		self.assertEqual(
+			moss_preset["keep_float"],
+			(
+				"video_embedder", "text_embedder", "time_embedding", "shared_block_modulation",
+				"video_head_modulation", "final_linear_video", "final_norm_video",
+			),
+		)
+		self.assertEqual(moss_preset["int4_sensitive"], ("proj.o", "proj.ffn_down"))
 
 	def test_model_adapter_auto_detects_minimax_h3(self):
 		class MiniMaxH3(nn.Module):
@@ -602,6 +743,62 @@ class QuantizationModeTests(unittest.TestCase):
 		self.assertEqual(
 			model_adapter._infer_model_type_from_modules(MiniMaxH3()),
 			loader.MODEL_TYPE_MINIMAX_H3,
+		)
+
+	def test_model_adapter_auto_detects_moss_image(self):
+		class MossImage(nn.Module):
+			def __init__(self):
+				super().__init__()
+				self.video_embedder = nn.Linear(4, 4)
+				self.text_embedder = nn.Module()
+				self.text_embedder.blocks = nn.ModuleList([nn.Module()])
+				self.time_embedding = nn.Sequential(nn.Linear(4, 4))
+				self.shared_block_modulation = nn.Linear(4, 4)
+				self.video_head_modulation = nn.Linear(4, 4)
+				self.final_linear_video = nn.Linear(4, 4)
+				self.layers = nn.ModuleList([nn.Module()])
+				self.layers[0].proj = nn.ModuleDict({"ffn_up_gate": nn.Linear(4, 4)})
+
+		self.assertEqual(
+			model_adapter._infer_model_type_from_modules(MossImage()),
+			loader.MODEL_TYPE_MOSS,
+		)
+
+	def test_moss_preset_matches_the_official_quantized_layer_boundary(self):
+		class MossImage(nn.Module):
+			def __init__(self):
+				super().__init__()
+				self.video_embedder = nn.Linear(256, 16, bias=False)
+				self.text_embedder = nn.Sequential(nn.Linear(256, 16, bias=False))
+				self.time_embedding = nn.Sequential(nn.Linear(256, 16, bias=False))
+				self.shared_block_modulation = nn.Linear(256, 16, bias=False)
+				self.video_head_modulation = nn.Linear(256, 16, bias=False)
+				self.final_linear_video = nn.Linear(256, 16, bias=False)
+				self.layers = nn.ModuleList([nn.Module()])
+				self.layers[0].proj = nn.ModuleDict({
+					"qkv": nn.Linear(256, 16, bias=False),
+					"o": nn.Linear(256, 16, bias=False),
+					"ffn_up_gate": nn.Linear(256, 16, bias=False),
+					"ffn_down": nn.Linear(256, 16, bias=False),
+				})
+
+		preset = loader.get_model_type_quantization_preset(loader.MODEL_TYPE_MOSS)
+		candidate_names = {
+			name
+			for name, _module in model_adapter._collect_int8_candidates(
+				MossImage(),
+				preset["keep_float"],
+			)
+		}
+
+		self.assertEqual(
+			candidate_names,
+			{
+				"layers.0.proj.qkv",
+				"layers.0.proj.o",
+				"layers.0.proj.ffn_up_gate",
+				"layers.0.proj.ffn_down",
+			},
 		)
 
 	def test_architecture_ratios_cover_residual_writeback_paths(self):
@@ -699,6 +896,30 @@ class QuantizationModeTests(unittest.TestCase):
 		self.assertEqual(len(quant.Int8TensorwiseOps.int4_mixed_selected_names), 2)
 		self.assertIn("layer.4", quant.Int8TensorwiseOps.int4_mixed_selected_names)
 
+	def test_loader_preselects_mixed_profile_from_safetensors_shapes(self):
+		from safetensors.torch import save_file
+
+		with tempfile.TemporaryDirectory() as temp_dir:
+			path = Path(temp_dir) / "mixed.safetensors"
+			save_file(
+				{
+					"model.diffusion_model.layers.0.proj.qkv.weight": torch.empty(16, 256),
+					"model.diffusion_model.layers.0.proj.o.weight": torch.empty(16, 256),
+					"model.diffusion_model.text_embedder.blocks.0.qkv.weight": torch.empty(16, 256),
+					"model.diffusion_model.layers.0.norm.weight": torch.empty(16),
+				},
+				str(path),
+			)
+
+			selected = loader._select_int4_mixed_layers_from_safetensors(
+				str(path),
+				keep_float_names=("text_embedder",),
+				priority_patterns=("proj.qkv",),
+				ratio=0.5,
+			)
+
+		self.assertEqual(selected, {"layers.0.proj.qkv"})
+
 	def test_public_quantization_inputs_do_not_use_legacy_int8_names(self):
 		adapter_inputs = model_adapter.INT8ModelAdapter.INPUT_TYPES()["required"]
 		loader_inputs = loader.UNetLoaderINTW8A8.INPUT_TYPES()["required"]
@@ -715,7 +936,7 @@ class QuantizationModeTests(unittest.TestCase):
 				model_adapter.QUANTIZATION_CONTROL_CHOICES,
 				{
 					"default": model_adapter.QUANTIZATION_CONTROL_AS_NEEDED,
-					"tooltip": "as_needed converts FP8 and floating-point inputs, but leaves MODEL inputs containing Toolkit-supported INT8, W4A4, or W4A8 layers unchanged. always converts remaining eligible layers; bypass returns the MODEL unchanged.",
+					"tooltip": "as_needed converts FP8 and floating-point inputs, but leaves MODEL inputs containing Toolkit-supported INT8, W4A4, W4A8, or W6A8 layers unchanged. always converts remaining eligible layers; bypass returns the MODEL unchanged.",
 				},
 			),
 		)
@@ -755,11 +976,14 @@ class QuantizationModeTests(unittest.TestCase):
 		native_int8_module.quant_format = "int8_tensorwise"
 		native_w4a8_module = nn.Linear(4, 4)
 		native_w4a8_module.quant_format = "asym_w4a8_int8"
+		native_w6a8_module = nn.Linear(4, 4)
+		native_w6a8_module.quant_format = "w6a8_int8"
 		native_fp8_module = nn.Linear(4, 4)
 		native_fp8_module.quant_format = "float8_e4m3fn"
 
 		self.assertTrue(model_adapter._module_has_target_quantization(native_int8_module))
 		self.assertTrue(model_adapter._module_has_target_quantization(native_w4a8_module))
+		self.assertTrue(model_adapter._module_has_target_quantization(native_w6a8_module))
 		self.assertFalse(model_adapter._module_has_target_quantization(native_fp8_module))
 
 	def test_bypass_returns_model_without_inspection(self):

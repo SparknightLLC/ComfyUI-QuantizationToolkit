@@ -2,7 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
-<details open><summary>2.3.0 - 27 September 2026</summary>
+<details open><summary>2.4.0 - 28 October 2026</summary>
+
+### Added
+
+- Added automatic architecture detection and quantization presets for MOSS-Image, matching the official Comfy-Org quantization boundary by keeping embeddings, modulation, and final projections floating-point while quantizing the transformer blocks.
+- Added `w4a8_mixed` for architecture-aware W4A8/W8A8 layer selection through the existing `int4_mixed_ratio` and sensitive-layer policy.
+- Added native ComfyUI/comfy-kitchen W6A8 checkpoint loading, on-the-fly conversion, inference, LoRA requantization, compile support, and native metadata export.
+- Added W6A8 checkpoint references and grouped-INT8 documentation.
+
+### Changed
+
+- Routed W4A8 and W6A8 through the shared `AsymW4A8Int8Layout` instead of adding a parallel quantized-layout implementation.
+- Extended native-format save summaries and Dynamic LoRA fallback handling to W6A8.
+
+</details>
+
+<details><summary>2.3.0 - 27 September 2026</summary>
 
 ### Added
 
